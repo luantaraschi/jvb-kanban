@@ -299,7 +299,11 @@ function switchTab(tab) {
 }
 
 function selectEmp(empId) {
-  if (currentUser && currentUser.role === 'employee' && empId !== currentUser.id) return;
+  if (currentUser && currentUser.role === 'employee' && empId !== currentUser.id) {
+    activeId = currentUser.id;
+    switchTab('all');
+    return;
+  }
   activeId = empId;
   renderTeam();
 }
@@ -499,20 +503,18 @@ function renderSidebar() {
   if (!list) return;
   list.innerHTML = '';
 
-  var visibleEmployees = currentUser && currentUser.role === 'employee'
-    ? employees.filter(function (emp) { return emp.id === currentUser.id; })
-    : employees;
-
-  visibleEmployees.forEach(function (emp) {
+  employees.forEach(function (emp) {
     var empTasks = tasks.filter(function (task) { return task.empId === emp.id; });
     var doing = empTasks.filter(function (task) { return task.status === 'doing'; }).length;
-    var isActive = emp.id === activeId;
+    var isOwnBoard = !currentUser || currentUser.role === 'manager' || emp.id === currentUser.id;
+    var isActive = currentTab === 'team' && emp.id === activeId;
     var row = document.createElement('div');
     row.className = 'emp-row' + (isActive ? ' active' : '');
     if (isActive && emp.pastel) {
       row.style.background = emp.pastel;
       row.style.borderColor = 'rgba(0,0,0,.08)';
     }
+    if (!isOwnBoard) row.title = 'Use Ver Todos para acompanhar a equipe';
     row.onclick = function () { selectEmp(emp.id); };
     row.innerHTML =
       '<div class="emp-av" style="background:' + (emp.color || '#888') + '">' + ini(emp.name) + '</div>' +

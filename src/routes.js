@@ -301,11 +301,6 @@ router.get('/team', requireAuth, asyncHandler(async (req, res) => {
   const params = [];
   let where = "WHERE role = 'employee' AND is_active = TRUE";
 
-  if (req.user.role !== 'manager') {
-    where += ' AND id = $1';
-    params.push(req.user.id);
-  }
-
   const result = await query(
     `
       SELECT id, username, name, role, color, pastel, col_bg, board_bg
