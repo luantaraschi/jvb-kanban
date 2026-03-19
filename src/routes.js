@@ -125,210 +125,36 @@ router.get('/tasks', requireAuth, asyncHandler(async (req, res) => {
 }));
 
 router.post('/tasks', requireAuth, asyncHandler(async (req, res) => {
-  const title = cleanText(req.body.title);
-  const description = cleanText(req.body.description);
-  const notes = cleanText(req.body.notes);
-  const assignedBy = cleanText(req.body.assignedBy);
-  const requestedStatus = cleanStatus(req.body.status);
-  const requestedUserId = Number(req.body.userId || req.user.id);
-
-  if (!title) {
-    return res.status(400).json({ error: 'Titulo obrigatorio' });
-  }
-
-  const userId = requestedUserId || req.user.id;
-  const userResult = await query(
-    `
-      SELECT id, name, role, is_active
-      FROM users
-      WHERE id = $1
-      LIMIT 1
-    `,
-    [userId]
-  );
-  const owner = userResult.rows[0];
-
-  if (!owner || !owner.is_active) {
-    return res.status(404).json({ error: 'Responsavel nao encontrado ou inativo' });
-  }
-
-  if (owner.role !== 'employee') {
-    return res.status(400).json({ error: 'As tarefas devem ser atribuidas a funcionarios' });
-  }
-
-  const taskId = cleanText(req.body.id) || uid();
-  const status = requestedStatus || 'todo';
-  const timerStart = status === 'doing' ? Date.now() : null;
-
-  await query(
-    `
-      INSERT INTO tasks (
-        id, title, description, notes, assigned_by, user_id, created_by_user_id, updated_by_user_id, status, timer_start
-      )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-    `,
-    [taskId, title, description, notes, assignedBy, userId, req.user.id, req.user.id, status, timerStart]
-  );
-
-  const result = await query(taskSelectById(), [taskId]);
-  await logTaskActivity({
-    taskId,
-    action: 'create',
-    actorUserId: req.user.id,
-    targetUserId: userId,
-    before: null,
-    after: taskSnapshot(result.rows[0])
+  const task = await createTaskRecord({
+    actorUser: req.user,
+    data: req.body
   });
-  res.status(201).json(normalizeTask(result.rows[0]));
+  res.status(201).json(task);
 }));
 
 router.put('/tasks/:id', requireAuth, asyncHandler(async (req, res) => {
-  const task = await findTask(req.params.id);
-  if (!task) {
-    return res.status(404).json({ error: 'Tarefa nao encontrada' });
-  }
-
-  const title = cleanText(req.body.title) || task.title;
-  const requestedUserId = Number(req.body.userId || task.user_id);
-  if (!title) {
-    return res.status(400).json({ error: 'Titulo obrigatorio' });
-  }
-
-  const owner = await findEmployeeTarget(requestedUserId);
-  const action = Number(task.user_id) !== Number(requestedUserId) ? 'reassign' : 'update';
-  const before = taskSnapshot(task);
-
-  await query(
-    `
-      UPDATE tasks
-      SET
-        title = $1,
-        description = $2,
-        notes = $3,
-        assigned_by = $4,
-        user_id = $5,
-        updated_by_user_id = $6,
-        last_edited_at = NOW(),
-        updated_at = NOW()
-      WHERE id = $7
-    `,
-    [
-      title,
-      cleanNullableText(req.body.description, task.description),
-      cleanNullableText(req.body.notes, task.notes),
-      cleanNullableText(req.body.assignedBy, task.assigned_by),
-      owner.id,
-      req.user.id,
-      req.params.id
-    ]
-  );
-
-  const result = await query(taskSelectById(), [req.params.id]);
-  await logTaskActivity({
+  const task = await updateTaskRecord({
     taskId: req.params.id,
-    action,
-    actorUserId: req.user.id,
-    targetUserId: owner.id,
-    before,
-    after: taskSnapshot(result.rows[0])
+    actorUser: req.user,
+    data: req.body
   });
-  res.json(normalizeTask(result.rows[0]));
+  res.json(task);
 }));
 
 router.patch('/tasks/:id/status', requireAuth, asyncHandler(async (req, res) => {
-  const task = await findTask(req.params.id);
-  if (!task) {
-    return res.status(404).json({ error: 'Tarefa nao encontrada' });
-  }
-
-  const newStatus = cleanStatus(req.body.newStatus);
-  if (!newStatus) {
-    return res.status(400).json({ error: 'Status invalido' });
-  }
-
-  const now = Date.now();
-  let elapsed = Number(task.elapsed || 0);
-  let timerStart = task.timer_start == null ? null : Number(task.timer_start);
-  let completedAt = task.completed_at;
-
-  if (task.status === 'doing' && timerStart) {
-    elapsed += now - timerStart;
-    timerStart = null;
-  }
-  if (newStatus === 'doing') {
-    timerStart = now;
-    completedAt = null;
-  }
-  if (newStatus === 'done') {
-    completedAt = localTimeLabel();
-    timerStart = null;
-  }
-  if (newStatus === 'todo') {
-    completedAt = null;
-  }
-
-  await query(
-    `
-      UPDATE tasks
-      SET
-        status = $1,
-        elapsed = $2,
-        timer_start = $3,
-        completed_at = $4,
-        needs_revisao = $5,
-        needs_protocolo = $6,
-        flag_agendei = $7,
-        flag_dispensa = $8,
-        flag_protreal = $9,
-        flag_naoaplic = $10,
-        updated_by_user_id = $11,
-        last_edited_at = NOW(),
-        updated_at = NOW()
-      WHERE id = $12
-    `,
-    [
-      newStatus,
-      elapsed,
-      timerStart,
-      completedAt,
-      !!req.body.needsRevisao,
-      !!req.body.needsProtocolo,
-      !!req.body.flagAgendei,
-      !!req.body.flagDispensa,
-      !!req.body.flagProtreal,
-      !!req.body.flagNaoAplic,
-      req.user.id,
-      req.params.id
-    ]
-  );
-
-  const result = await query(taskSelectById(), [req.params.id]);
-  await logTaskActivity({
+  const task = await changeTaskStatusRecord({
     taskId: req.params.id,
-    action: 'status_change',
-    actorUserId: req.user.id,
-    targetUserId: Number(task.user_id),
-    before: taskSnapshot(task),
-    after: taskSnapshot(result.rows[0])
+    actorUser: req.user,
+    data: req.body
   });
-  res.json(normalizeTask(result.rows[0]));
+  res.json(task);
 }));
 
 router.delete('/tasks/:id', requireAuth, asyncHandler(async (req, res) => {
-  const task = await findTask(req.params.id);
-  if (!task) {
-    return res.status(404).json({ error: 'Tarefa nao encontrada' });
-  }
-
-  await logTaskActivity({
+  await deleteTaskRecord({
     taskId: req.params.id,
-    action: 'delete',
-    actorUserId: req.user.id,
-    targetUserId: Number(task.user_id),
-    before: taskSnapshot(task),
-    after: null
+    actorUser: req.user
   });
-  await query('DELETE FROM tasks WHERE id = $1', [req.params.id]);
   res.json({ ok: true });
 }));
 
@@ -683,6 +509,38 @@ router.post('/manager/ai/chat', requireManager, asyncHandler(async (req, res) =>
   }
 }));
 
+router.post('/manager/ai/execute', requireManager, asyncHandler(async (req, res) => {
+  const inputJson = {
+    type: cleanText(req.body.type),
+    taskId: cleanText(req.body.taskId),
+    payload: req.body && typeof req.body.payload === 'object' ? req.body.payload : {}
+  };
+
+  try {
+    const outputJson = await executeAssistantTaskAction({
+      actorUser: req.user,
+      action: inputJson
+    });
+    const run = await persistAiRun({
+      kind: 'chat',
+      createdByUserId: req.user.id,
+      inputJson,
+      outputJson,
+      status: 'completed'
+    });
+    res.json(Object.assign({ runId: run.id }, outputJson));
+  } catch (error) {
+    await persistAiRun({
+      kind: 'chat',
+      createdByUserId: req.user.id,
+      inputJson,
+      outputJson: { error: error.message },
+      status: 'failed'
+    });
+    throw error;
+  }
+}));
+
 router.post('/manager/ai/feedback', requireManager, asyncHandler(async (req, res) => {
   const inputJson = { period: req.body.period };
 
@@ -835,6 +693,291 @@ router.post('/manager/ai/initial-triage/:runId/create-tasks', requireManager, as
   res.status(201).json({ ok: true, created });
 }));
 
+async function executeAssistantTaskAction(input) {
+  const action = sanitizeAssistantAction(input.action);
+  const activityMeta = { origin: 'assistant', confirmedByUserId: Number(input.actorUser.id) };
+
+  if (action.type === 'create_task') {
+    const task = await createTaskRecord({
+      actorUser: input.actorUser,
+      data: action.payload,
+      activityMeta
+    });
+    return {
+      ok: true,
+      type: action.type,
+      message: 'Tarefa criada via assistente para ' + task.empName + '.',
+      task
+    };
+  }
+
+  if (action.type === 'update_task' || action.type === 'reassign_task') {
+    const task = await updateTaskRecord({
+      taskId: action.taskId,
+      actorUser: input.actorUser,
+      data: action.payload,
+      activityMeta
+    });
+    return {
+      ok: true,
+      type: action.type,
+      message: action.type === 'reassign_task'
+        ? 'Tarefa redistribuida para ' + task.empName + '.'
+        : 'Tarefa atualizada via assistente.',
+      task
+    };
+  }
+
+  if (action.type === 'change_status') {
+    const task = await changeTaskStatusRecord({
+      taskId: action.taskId,
+      actorUser: input.actorUser,
+      data: action.payload,
+      activityMeta
+    });
+    return {
+      ok: true,
+      type: action.type,
+      message: 'Status alterado para ' + statusLabel(task.status) + '.',
+      task
+    };
+  }
+
+  if (action.type === 'delete_task') {
+    const deletedTask = await deleteTaskRecord({
+      taskId: action.taskId,
+      actorUser: input.actorUser,
+      activityMeta
+    });
+    return {
+      ok: true,
+      type: action.type,
+      message: 'Tarefa removida via assistente.',
+      deletedTaskId: deletedTask.id,
+      deletedTaskTitle: deletedTask.title
+    };
+  }
+
+  throw httpError(400, 'Tipo de acao nao suportado');
+}
+
+async function createTaskRecord(input) {
+  const actorUser = input.actorUser;
+  const data = input.data || {};
+  const title = cleanText(data.title);
+  const description = cleanText(data.description);
+  const notes = cleanText(data.notes);
+  const assignedBy = cleanText(data.assignedBy);
+  const requestedStatus = cleanStatus(data.status);
+  const requestedUserId = Number(data.userId || actorUser.id);
+
+  if (!title) {
+    throw httpError(400, 'Titulo obrigatorio');
+  }
+
+  const owner = await findEmployeeTarget(requestedUserId || actorUser.id);
+  const taskId = cleanText(data.id) || uid();
+  const status = requestedStatus || 'todo';
+  const timerStart = status === 'doing' ? Date.now() : null;
+
+  await query(
+    `
+      INSERT INTO tasks (
+        id, title, description, notes, assigned_by, user_id, created_by_user_id, updated_by_user_id, status, timer_start
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+    `,
+    [taskId, title, description, notes, assignedBy, owner.id, actorUser.id, actorUser.id, status, timerStart]
+  );
+
+  const result = await query(taskSelectById(), [taskId]);
+  await logTaskActivity({
+    taskId,
+    action: 'create',
+    actorUserId: actorUser.id,
+    targetUserId: owner.id,
+    before: null,
+    after: taskSnapshot(result.rows[0]),
+    meta: input.activityMeta
+  });
+  return normalizeTask(result.rows[0]);
+}
+
+async function updateTaskRecord(input) {
+  const actorUser = input.actorUser;
+  const data = input.data || {};
+  const task = await findTask(input.taskId);
+  if (!task) {
+    throw httpError(404, 'Tarefa nao encontrada');
+  }
+
+  const title = data.title == null ? task.title : cleanText(data.title);
+  const requestedUserId = data.userId == null ? Number(task.user_id) : Number(data.userId);
+  if (!title) {
+    throw httpError(400, 'Titulo obrigatorio');
+  }
+
+  const owner = await findEmployeeTarget(requestedUserId);
+  const action = Number(task.user_id) !== Number(requestedUserId) ? 'reassign' : 'update';
+  const before = taskSnapshot(task);
+
+  await query(
+    `
+      UPDATE tasks
+      SET
+        title = $1,
+        description = $2,
+        notes = $3,
+        assigned_by = $4,
+        user_id = $5,
+        updated_by_user_id = $6,
+        last_edited_at = NOW(),
+        updated_at = NOW()
+      WHERE id = $7
+    `,
+    [
+      title,
+      cleanNullableText(data.description, task.description),
+      cleanNullableText(data.notes, task.notes),
+      cleanNullableText(data.assignedBy, task.assigned_by),
+      owner.id,
+      actorUser.id,
+      input.taskId
+    ]
+  );
+
+  const result = await query(taskSelectById(), [input.taskId]);
+  await logTaskActivity({
+    taskId: input.taskId,
+    action,
+    actorUserId: actorUser.id,
+    targetUserId: owner.id,
+    before,
+    after: taskSnapshot(result.rows[0]),
+    meta: input.activityMeta
+  });
+  return normalizeTask(result.rows[0]);
+}
+
+async function changeTaskStatusRecord(input) {
+  const actorUser = input.actorUser;
+  const data = input.data || {};
+  const task = await findTask(input.taskId);
+  if (!task) {
+    throw httpError(404, 'Tarefa nao encontrada');
+  }
+
+  const newStatus = cleanStatus(data.newStatus);
+  if (!newStatus) {
+    throw httpError(400, 'Status invalido');
+  }
+
+  const now = Date.now();
+  let elapsed = Number(task.elapsed || 0);
+  let timerStart = task.timer_start == null ? null : Number(task.timer_start);
+  let completedAt = task.completed_at;
+
+  if (task.status === 'doing' && timerStart) {
+    elapsed += now - timerStart;
+    timerStart = null;
+  }
+  if (newStatus === 'doing') {
+    timerStart = now;
+    completedAt = null;
+  }
+  if (newStatus === 'done') {
+    completedAt = localTimeLabel();
+    timerStart = null;
+  }
+  if (newStatus === 'todo') {
+    completedAt = null;
+  }
+
+  const flags = normalizeTaskFlags(data);
+
+  await query(
+    `
+      UPDATE tasks
+      SET
+        status = $1,
+        elapsed = $2,
+        timer_start = $3,
+        completed_at = $4,
+        needs_revisao = $5,
+        needs_protocolo = $6,
+        flag_agendei = $7,
+        flag_dispensa = $8,
+        flag_protreal = $9,
+        flag_naoaplic = $10,
+        updated_by_user_id = $11,
+        last_edited_at = NOW(),
+        updated_at = NOW()
+      WHERE id = $12
+    `,
+    [
+      newStatus,
+      elapsed,
+      timerStart,
+      completedAt,
+      flags.needsRevisao,
+      flags.needsProtocolo,
+      flags.flagAgendei,
+      flags.flagDispensa,
+      flags.flagProtreal,
+      flags.flagNaoAplic,
+      actorUser.id,
+      input.taskId
+    ]
+  );
+
+  const result = await query(taskSelectById(), [input.taskId]);
+  await logTaskActivity({
+    taskId: input.taskId,
+    action: 'status_change',
+    actorUserId: actorUser.id,
+    targetUserId: Number(task.user_id),
+    before: taskSnapshot(task),
+    after: taskSnapshot(result.rows[0]),
+    meta: input.activityMeta
+  });
+  return normalizeTask(result.rows[0]);
+}
+
+async function deleteTaskRecord(input) {
+  const task = await findTask(input.taskId);
+  if (!task) {
+    throw httpError(404, 'Tarefa nao encontrada');
+  }
+
+  await logTaskActivity({
+    taskId: input.taskId,
+    action: 'delete',
+    actorUserId: input.actorUser.id,
+    targetUserId: Number(task.user_id),
+    before: taskSnapshot(task),
+    after: null,
+    meta: input.activityMeta
+  });
+  await query('DELETE FROM tasks WHERE id = $1', [input.taskId]);
+  return task;
+}
+
+function sanitizeAssistantAction(action) {
+  const type = cleanText(action && action.type).toLowerCase();
+  const taskId = cleanText(action && action.taskId);
+  const payload = action && typeof action.payload === 'object' ? action.payload : {};
+  const valid = ['create_task', 'update_task', 'change_status', 'reassign_task', 'delete_task'];
+
+  if (!valid.includes(type)) {
+    throw httpError(400, 'Acao do assistente invalida');
+  }
+  if (type !== 'create_task' && !taskId) {
+    throw httpError(400, 'Tarefa alvo obrigatoria para essa acao');
+  }
+
+  return { type, taskId, payload };
+}
+
 function asyncHandler(fn) {
   return function wrapped(req, res, next) {
     Promise.resolve(fn(req, res, next)).catch(next);
@@ -874,6 +1017,25 @@ function cleanStatus(value) {
 
 function cleanRole(value) {
   return ['employee', 'manager'].includes(value) ? value : '';
+}
+
+function normalizeTaskFlags(value) {
+  return {
+    needsRevisao: !!value.needsRevisao,
+    needsProtocolo: !!value.needsProtocolo,
+    flagAgendei: !!value.flagAgendei,
+    flagDispensa: !!value.flagDispensa,
+    flagProtreal: !!value.flagProtreal,
+    flagNaoAplic: !!value.flagNaoAplic
+  };
+}
+
+function statusLabel(value) {
+  return {
+    todo: 'A Fazer',
+    doing: 'Em andamento',
+    done: 'Concluida'
+  }[value] || value;
 }
 
 function isValidUsername(value) {
@@ -1094,10 +1256,16 @@ async function logTaskActivity(input) {
       input.action,
       input.actorUserId,
       input.targetUserId,
-      input.before ? JSON.stringify(input.before) : null,
-      input.after ? JSON.stringify(input.after) : null
+      input.before ? JSON.stringify(attachActivityMeta(input.before, input.meta)) : null,
+      input.after ? JSON.stringify(attachActivityMeta(input.after, input.meta)) : null
     ]
   );
+}
+
+function attachActivityMeta(snapshot, meta) {
+  if (!snapshot) return null;
+  if (!meta) return snapshot;
+  return Object.assign({}, snapshot, { _activity: meta });
 }
 
 async function persistAiRun(input) {

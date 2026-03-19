@@ -8,7 +8,6 @@ var activeId = null;
 var timers = {};
 var dragId = null;
 var currentTab = 'team';
-var mgrUnlocked = false;
 var histFilterEmp = '';
 var histFilterDate = '';
 var historyData = [];
@@ -27,6 +26,8 @@ var aiAssignmentResult = null;
 var aiAssignmentLoading = false;
 var aiInitialResult = null;
 var aiInitialLoading = false;
+var aiPendingAction = null;
+var aiActionPending = false;
 var aiAssignmentDraft = { title: '', description: '', assignedBy: '' };
 var aiInitialDraft = { title: '', initialText: '', contextNote: '' };
 var aiChatDraft = '';
@@ -394,7 +395,7 @@ async function addTask() {
     activeId = task.empId;
     renderTeam();
     if (currentTab === 'all') renderAll();
-    if (currentTab === 'mgr' && mgrUnlocked) renderMgr();
+    if (currentTab === 'mgr') renderMgr();
     overlayClose('addModal');
     showToast('Tarefa criada');
   } catch (error) {
@@ -409,7 +410,7 @@ async function deleteTask(id) {
     tasks = tasks.filter(function (task) { return task.id !== id; });
     renderTeam();
     if (currentTab === 'all') renderAll();
-    if (currentTab === 'mgr' && mgrUnlocked) renderMgr();
+    if (currentTab === 'mgr') renderMgr();
     showToast('Tarefa removida');
   } catch (error) {
     showToast(error.message);
@@ -436,7 +437,7 @@ async function doChangeStatus(id, nextStatus, flags) {
     else stopTimerLocal(id);
     renderTeam();
     if (currentTab === 'all') renderAll();
-    if (currentTab === 'mgr' && mgrUnlocked) renderMgr();
+    if (currentTab === 'mgr') renderMgr();
   } catch (error) {
     showToast(error.message);
   }
@@ -532,7 +533,7 @@ async function saveEdit() {
     activeId = updated.empId;
     renderTeam();
     if (currentTab === 'all') renderAll();
-    if (currentTab === 'mgr' && mgrUnlocked) renderMgr();
+    if (currentTab === 'mgr') renderMgr();
     overlayClose('editModal');
     showToast('Tarefa atualizada');
   } catch (error) {
@@ -762,61 +763,11 @@ function renderMgr() {
     panel.innerHTML = '<div style="padding:40px;text-align:center;color:var(--text-light)">Acesso restrito ao gestor.</div>';
     return;
   }
-  if (!mgrUnlocked) {
-    panel.innerHTML = buildLockScreen();
-    return;
-  }
-  buildDashboard().then(function (html) {
+  buildDashboardV2().then(function (html) {
     panel.innerHTML = html;
   }).catch(function (error) {
     panel.innerHTML = '<div style="padding:40px;text-align:center;color:var(--red)">Erro ao carregar painel: ' + esc(error.message) + '</div>';
   });
-}
-
-function buildLockScreen() {
-  return '<div class="lock-screen"><div class="lock-box">' +
-    '<div class="lock-icon-big">🔐</div>' +
-    '<div class="lock-title">Area do <em>Gestor</em></div>' +
-    '<div class="lock-sub">Digite a senha para acessar relatorios e metricas.</div>' +
-    '<div class="lock-input-wrap">' +
-    '<input class="lock-input" id="pwInput" type="password" placeholder="••••••••" maxlength="32" oninput="document.getElementById(\'pwErr\').textContent=\'\'" onkeydown="if(event.key===\'Enter\')tryMgrUnlock()" />' +
-    '<button class="toggle-pw" onclick="var i=document.getElementById(\'pwInput\');i.type=i.type===\'password\'?\'text\':\'password\'">👁</button>' +
-    '</div>' +
-    '<div class="lock-error" id="pwErr"></div>' +
-    '<button class="btn-unlock" onclick="tryMgrUnlock()">Entrar no Painel</button>' +
-    '</div></div>';
-}
-
-async function tryMgrUnlock() {
-  var val = document.getElementById('pwInput') ? document.getElementById('pwInput').value : '';
-  if (!val) return;
-  try {
-    if (currentUser && currentUser.role === 'manager') {
-      mgrUnlocked = true;
-      document.getElementById('lockIcon').textContent = '🔓';
-      await loadManagerUsers();
-      renderMgr();
-      showToast('Acesso liberado');
-    } else {
-      throw new Error('Acesso restrito');
-    }
-  } catch (error) {
-    var inp = document.getElementById('pwInput');
-    if (inp) {
-      inp.classList.add('error');
-      inp.value = '';
-      setTimeout(function () { inp.classList.remove('error'); }, 400);
-    }
-    var err = document.getElementById('pwErr');
-    if (err) err.textContent = 'Acesso negado.';
-  }
-}
-
-function lockMgr() {
-  mgrUnlocked = false;
-  document.getElementById('lockIcon').textContent = '🔒';
-  renderMgr();
-  showToast('Sessao encerrada');
 }
 
 function tagBadge(label, bg, color, border) {
@@ -944,6 +895,164 @@ function buildAiSection() {
     '</div>';
 }
 
+function buildAiSectionV2() {
+  var chatHtml = aiChatMessages.length
+    ? aiChatMessages.map(function (item) {
+      var role = item.role === 'assistant' ? 'assistant' : 'user';
+      return '<div class="ai-bubble-row ' + role + '">' +
+        '<div class="ai-bubble ' + role + '">' + esc(item.content) + '</div>' +
+        '</div>';
+    }).join('')
+    : '<div class="ai-empty-state">' +
+      '<div class="ai-empty-kicker">Modo consultivo + operacional</div>' +
+      '<div class="ai-empty-title">O assistente lê a operação e prepara ações reais em tarefas.</div>' +
+      '<div class="ai-empty-copy">Peça análise de produtividade, redistribuição, criação, edição, movimentação ou remoção de tarefas. Toda mutação exige sua confirmação explícita.</div>' +
+      '</div>';
+
+  var feedbackHtml = buildAiFeedbackPanel();
+  var assignmentHtml = buildAiAssignmentPanel();
+  var triageHtml = buildAiTriagePanel();
+
+  return '<section class="ai-shell">' +
+    '<div class="ai-chat-card">' +
+      '<div class="ai-card-head">' +
+        '<div>' +
+          '<div class="ai-kicker">Assistente IA do Gestor</div>' +
+          '<h2 class="ai-title">Análise operacional com execução confirmável.</h2>' +
+          '<p class="ai-copy">O assistente pode preparar criação, edição, redistribuição, mudança de status e exclusão de tarefas. Nada roda sem sua autorização.</p>' +
+        '</div>' +
+        '<div class="ai-head-status">' +
+          '<span class="ai-status-pill ' + (aiChatPending || aiActionPending ? 'busy' : 'ready') + '">' + (aiChatPending ? 'Respondendo' : aiActionPending ? 'Executando' : 'Pronto') + '</span>' +
+          '<span class="ai-status-note">Fluxo assistido, com confirmação manual</span>' +
+        '</div>' +
+      '</div>' +
+      '<div class="ai-messages">' + chatHtml + '</div>' +
+      (aiPendingAction ? buildAiPendingActionCard() : '') +
+      '<div class="ai-composer">' +
+        '<textarea id="aiChatInput" class="ai-textarea" oninput="aiChatDraft=this.value" placeholder="Ex: redistribua a tarefa de protocolo do Luan para Ana Clara e coloque em andamento.">' + esc(aiChatDraft) + '</textarea>' +
+        '<div class="ai-composer-footer">' +
+          '<div class="ai-helper-text">Pedidos operacionais sempre voltam com resumo da ação e botões de confirmar ou cancelar.</div>' +
+          '<button class="btn btn-primary btn-sm" onclick="runAiChat()">' + (aiChatPending ? 'Aguarde...' : 'Enviar') + '</button>' +
+        '</div>' +
+      '</div>' +
+    '</div>' +
+    '<div class="ai-tool-grid">' +
+      '<div class="ai-tool-card">' +
+        '<div class="ai-tool-head"><strong>Feedback de performance</strong><div class="ai-inline-actions"><select id="aiFeedbackPeriod" onchange="aiFeedbackPeriod=this.value" class="ai-select"><option value="today"' + (aiFeedbackPeriod === 'today' ? ' selected' : '') + '>Hoje</option><option value="7d"' + (aiFeedbackPeriod === '7d' ? ' selected' : '') + '>7 dias</option><option value="30d"' + (aiFeedbackPeriod === '30d' ? ' selected' : '') + '>30 dias</option><option value="history"' + (aiFeedbackPeriod === 'history' ? ' selected' : '') + '>Histórico</option></select><button class="btn btn-primary btn-sm" onclick="runAiFeedback()">Gerar</button></div></div>' +
+        '<div class="ai-tool-body">' + feedbackHtml + '</div>' +
+      '</div>' +
+      '<div class="ai-tool-card">' +
+        '<div class="ai-tool-head"><strong>Distribuição assistida</strong><button class="btn btn-primary btn-sm" onclick="runAiAssignment()">Sugerir</button></div>' +
+        '<div class="ai-form-grid">' +
+          '<input id="aiAssignTitle" class="ai-input" value="' + esc(aiAssignmentDraft.title) + '" oninput="aiAssignmentDraft.title=this.value" placeholder="Título da tarefa" />' +
+          '<textarea id="aiAssignDesc" class="ai-textarea compact" oninput="aiAssignmentDraft.description=this.value" placeholder="Descrição / contexto da tarefa">' + esc(aiAssignmentDraft.description) + '</textarea>' +
+          '<input id="aiAssignBy" class="ai-input" value="' + esc(aiAssignmentDraft.assignedBy) + '" oninput="aiAssignmentDraft.assignedBy=this.value" placeholder="Designado por" />' +
+        '</div>' +
+        '<div class="ai-tool-body">' + assignmentHtml + '</div>' +
+      '</div>' +
+      '<div class="ai-tool-card">' +
+        '<div class="ai-tool-head"><strong>Triagem de iniciais</strong><button class="btn btn-primary btn-sm" onclick="runAiInitialTriage()">Analisar</button></div>' +
+        '<div class="ai-form-grid">' +
+          '<input id="aiInitialTitle" class="ai-input" value="' + esc(aiInitialDraft.title) + '" oninput="aiInitialDraft.title=this.value" placeholder="Título / assunto do caso" />' +
+          '<textarea id="aiInitialText" class="ai-textarea tall" oninput="aiInitialDraft.initialText=this.value" placeholder="Cole aqui o texto da inicial">' + esc(aiInitialDraft.initialText) + '</textarea>' +
+          '<textarea id="aiInitialContext" class="ai-textarea compact" oninput="aiInitialDraft.contextNote=this.value" placeholder="Contexto extra opcional (cliente, urgência, prazo, observações)">' + esc(aiInitialDraft.contextNote) + '</textarea>' +
+        '</div>' +
+        '<div class="ai-tool-body">' + triageHtml + '</div>' +
+      '</div>' +
+    '</div>' +
+  '</section>';
+}
+
+function buildAiPendingActionCard() {
+  var preview = aiPendingAction && aiPendingAction.actionPreview ? aiPendingAction.actionPreview : {};
+  var meta = [];
+  if (preview.currentTaskTitle) meta.push('<span><strong>Tarefa:</strong> ' + esc(preview.currentTaskTitle) + '</span>');
+  if (preview.currentAssignee) meta.push('<span><strong>Atual:</strong> ' + esc(preview.currentAssignee) + '</span>');
+  if (preview.nextAssignee) meta.push('<span><strong>Novo responsável:</strong> ' + esc(preview.nextAssignee) + '</span>');
+  if (preview.nextStatus) meta.push('<span><strong>Status:</strong> ' + esc(formatTaskStatusLabel(preview.nextStatus)) + '</span>');
+
+  return '<div class="ai-pending-card">' +
+    '<div class="ai-pending-head">' +
+      '<div><div class="ai-pending-kicker">Confirmação obrigatória</div><div class="ai-pending-title">' + esc(preview.label || 'Ação preparada pelo assistente') + '</div></div>' +
+      '<span class="ai-status-pill warn">' + (aiActionPending ? 'Executando' : 'Pendente') + '</span>' +
+    '</div>' +
+    '<div class="ai-pending-summary">' + esc(preview.summary || aiPendingAction.reason || '') + '</div>' +
+    (meta.length ? '<div class="ai-pending-meta">' + meta.join('') + '</div>' : '') +
+    (aiPendingAction.reason ? '<div class="ai-pending-reason">' + esc(aiPendingAction.reason) + '</div>' : '') +
+    '<div class="ai-confirm-actions">' +
+      '<button class="btn btn-primary btn-sm" onclick="confirmAiPendingAction()">' + (aiActionPending ? 'Executando...' : 'Confirmar ação') + '</button>' +
+      '<button class="btn btn-ghost btn-sm" onclick="cancelAiPendingAction()">Cancelar</button>' +
+    '</div>' +
+  '</div>';
+}
+
+function buildAiFeedbackPanel() {
+  if (aiFeedbackLoading) return '<div class="ai-result-empty">Gerando feedback...</div>';
+  if (!aiFeedbackResult) return '<div class="ai-result-empty">Gere uma leitura assistida da produção por período.</div>';
+
+  return '<div class="ai-result-stack">' +
+    '<div class="ai-result-lead"><strong>Resumo:</strong> ' + esc(aiFeedbackResult.summary || '') + '</div>' +
+    buildMiniList('Destaques', aiFeedbackResult.teamHighlights) +
+    buildMiniList('Gargalos', aiFeedbackResult.bottlenecks) +
+    buildMiniList('Recomendações', aiFeedbackResult.recommendations) +
+    '<div class="ai-result-grid">' + (aiFeedbackResult.employees || []).map(function (item) {
+      return '<div class="ai-mini-card">' +
+        '<div class="ai-mini-title">' + esc(item.name) + ' <span>' + esc(item.scoreLabel || '') + '</span></div>' +
+        '<div class="ai-mini-copy">' + esc(item.feedback || '') + '</div>' +
+        '<div class="ai-mini-meta">Risco: ' + esc(item.risk || '') + '</div>' +
+        '<div class="ai-mini-meta">Próximo passo: ' + esc(item.nextStep || '') + '</div>' +
+      '</div>';
+    }).join('') + '</div>' +
+  '</div>';
+}
+
+function buildAiAssignmentPanel() {
+  if (aiAssignmentLoading) return '<div class="ai-result-empty">Calculando sugestão...</div>';
+  if (!aiAssignmentResult) return '<div class="ai-result-empty">Preencha o rascunho da tarefa para ranquear os melhores responsáveis.</div>';
+
+  return '<div class="ai-result-stack">' +
+    '<div class="ai-result-lead"><strong>Síntese:</strong> ' + esc(aiAssignmentResult.summary || '') + '</div>' +
+    (aiAssignmentResult.candidates || []).map(function (candidate, index) {
+      return '<div class="ai-mini-card">' +
+        '<div class="ai-mini-title">' + (index + 1) + '. ' + esc(candidate.name) + ' <span>score ' + esc(candidate.score) + '</span></div>' +
+        '<div class="ai-mini-copy">' + esc(candidate.reason || '') + '</div>' +
+        '<div class="ai-inline-actions"><button class="btn btn-primary btn-sm" onclick="applyAssignmentCandidate(' + candidate.userId + ')">Usar no cadastro</button></div>' +
+      '</div>';
+    }).join('') +
+  '</div>';
+}
+
+function buildAiTriagePanel() {
+  if (aiInitialLoading) return '<div class="ai-result-empty">Analisando inicial...</div>';
+  if (!aiInitialResult) return '<div class="ai-result-empty">Cole o texto da inicial para gerar checklist, prioridade e tarefas sugeridas.</div>';
+
+  return '<div class="ai-result-stack">' +
+    '<div class="ai-result-lead"><strong>Prioridade:</strong> ' + esc(formatPriority(aiInitialResult.priority)) + '</div>' +
+    '<div class="ai-mini-copy">' + esc(aiInitialResult.summary || '') + '</div>' +
+    buildMiniList('Riscos', aiInitialResult.risks) +
+    buildMiniList('Checklist', aiInitialResult.checklist) +
+    buildMiniList('Próximos passos', aiInitialResult.nextSteps) +
+    '<div class="ai-result-grid">' + (aiInitialResult.suggestedTasks || []).map(function (task, index) {
+      return '<div class="ai-mini-card">' +
+        '<div class="ai-mini-title">' + esc(task.title) + '</div>' +
+        '<div class="ai-mini-copy">' + esc(task.description || '') + '</div>' +
+        '<div class="ai-mini-meta">Responsável sugerido: ' + esc(task.assignedToName || '') + '</div>' +
+        '<div class="ai-mini-meta">' + esc(task.reason || '') + '</div>' +
+        '<div class="ai-inline-actions"><button class="btn btn-primary btn-sm" onclick="useTriageSuggestion(' + index + ')">Abrir no cadastro</button></div>' +
+      '</div>';
+    }).join('') + '</div>' +
+    (aiInitialResult.runId ? '<div class="ai-inline-actions"><button class="btn btn-amber btn-sm" onclick="createInitialTasksFromAi()">Criar tarefas sugeridas</button></div>' : '') +
+  '</div>';
+}
+
+function formatTaskStatusLabel(value) {
+  return {
+    todo: 'A Fazer',
+    doing: 'Em andamento',
+    done: 'Concluída'
+  }[value] || value || '';
+}
+
 function buildMiniList(title, items) {
   var list = Array.isArray(items) ? items.filter(Boolean) : [];
   if (!list.length) return '';
@@ -1001,6 +1110,7 @@ async function runAiChat() {
   if (!message || aiChatPending) return;
   aiChatMessages.push({ role: 'user', content: message });
   aiChatDraft = '';
+  aiPendingAction = null;
   aiChatPending = true;
   renderMgr();
   try {
@@ -1008,6 +1118,15 @@ async function runAiChat() {
       message: message,
       history: aiChatMessages.slice(-8)
     });
+    aiPendingAction = reply.pendingAction
+      ? {
+        type: reply.pendingAction.type,
+        taskId: reply.pendingAction.taskId,
+        payload: reply.pendingAction.payload || {},
+        reason: reply.pendingAction.reason || '',
+        actionPreview: reply.actionPreview || null
+      }
+      : null;
     aiChatMessages.push({ role: 'assistant', content: reply.reply || 'Sem resposta da IA.' });
     if (reply.suggestions && reply.suggestions.length) {
       aiChatMessages.push({ role: 'assistant', content: 'Sugestões:\n- ' + reply.suggestions.join('\n- ') });
@@ -1021,6 +1140,38 @@ async function runAiChat() {
     aiChatPending = false;
     renderMgr();
   }
+}
+
+async function confirmAiPendingAction() {
+  if (!aiPendingAction || aiActionPending) return;
+  aiActionPending = true;
+  renderMgr();
+  try {
+    var result = await api('POST', '/manager/ai/execute', {
+      type: aiPendingAction.type,
+      taskId: aiPendingAction.taskId,
+      payload: aiPendingAction.payload
+    });
+    aiChatMessages.push({ role: 'assistant', content: result.message || 'Ação executada com sucesso.' });
+    aiPendingAction = null;
+    await refreshWorkspace(true);
+    renderTeam();
+    if (currentTab === 'all') renderAll();
+    if (currentTab === 'mgr') renderMgr();
+    showToast('Ação confirmada');
+  } catch (error) {
+    showToast(error.message);
+  } finally {
+    aiActionPending = false;
+    renderMgr();
+  }
+}
+
+function cancelAiPendingAction() {
+  if (!aiPendingAction) return;
+  aiChatMessages.push({ role: 'assistant', content: 'Ação cancelada. Nenhuma tarefa foi alterada.' });
+  aiPendingAction = null;
+  renderMgr();
 }
 
 function applyAssignmentCandidate(userId) {
@@ -1166,6 +1317,119 @@ async function buildDashboard() {
     '<div class="section-title">Historico de Dias</div>' +
     historyHtml +
     '<div class="section-title">Seguranca</div>' +
+    pwSection +
+    '</div>';
+}
+
+async function buildDashboardV2() {
+  await loadManagerUsers();
+
+  var total = tasks.length;
+  var doing = tasks.filter(function (task) { return task.status === 'doing'; }).length;
+  var done = tasks.filter(function (task) { return task.status === 'done'; }).length;
+  var todo = tasks.filter(function (task) { return task.status === 'todo'; }).length;
+  var totalMs = tasks.reduce(function (sum, task) {
+    return sum + (task.elapsed || 0) + (task.timerStart ? Date.now() - task.timerStart : 0);
+  }, 0);
+
+  var byEmp = {};
+  tasks.forEach(function (task) {
+    if (!byEmp[task.empId]) byEmp[task.empId] = { empId: task.empId, name: task.empName, color: task.color, tasks: [] };
+    byEmp[task.empId].tasks.push(task);
+  });
+
+  var topEmp = '—';
+  var topDone = 0;
+  Object.keys(byEmp).forEach(function (key) {
+    var doneCount = byEmp[key].tasks.filter(function (task) { return task.status === 'done'; }).length;
+    if (doneCount > topDone) {
+      topDone = doneCount;
+      topEmp = byEmp[key].name.split(' ')[0];
+    }
+  });
+
+  var aiHtml = buildAiSectionV2();
+  var usersHtml = buildUsersSection();
+  var historyHtml = await buildHistoryPanel();
+  var dateStr = new Date().toLocaleDateString('pt-BR', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+
+  var kpis = '<div class="kpi-row">' +
+    '<div class="kpi-card kc-blue"><div class="kpi-label">Em andamento</div><div class="kpi-value">' + doing + '</div><div class="kpi-sub">' + todo + ' aguardando</div></div>' +
+    '<div class="kpi-card kc-green"><div class="kpi-label">Concluídas</div><div class="kpi-value">' + done + '</div><div class="kpi-sub">de ' + total + ' no total</div></div>' +
+    '<div class="kpi-card kc-amber"><div class="kpi-label">Tempo total</div><div class="kpi-value" style="font-size:20px">' + fmtMs(totalMs) + '</div><div class="kpi-sub">acumulado no board atual</div></div>' +
+    '<div class="kpi-card kc-purple"><div class="kpi-label">Mais produtivo</div><div class="kpi-value" style="font-size:18px">' + esc(topEmp) + '</div><div class="kpi-sub">' + topDone + ' concluída' + (topDone !== 1 ? 's' : '') + '</div></div>' +
+    '</div>';
+
+  var employeeRows = employees.map(function (emp) {
+    var empTasks = byEmp[emp.id] ? byEmp[emp.id].tasks : [];
+    var doneCount = empTasks.filter(function (task) { return task.status === 'done'; }).length;
+    var doingCount = empTasks.filter(function (task) { return task.status === 'doing'; }).length;
+    var pct = empTasks.length ? Math.round(doneCount / empTasks.length * 100) : 0;
+    return '<div class="et-row">' +
+      '<div class="et-emp"><div class="et-av" style="background:' + emp.color + '">' + ini(emp.name) + '</div><span class="et-nm">' + esc(emp.name) + '</span></div>' +
+      '<div class="et-val">' + empTasks.length + '</div>' +
+      '<div class="et-val et-doing">' + doingCount + '</div>' +
+      '<div class="et-val et-done">' + doneCount + '</div>' +
+      '<div style="display:flex;align-items:center;gap:7px"><div class="prog-bar"><div class="prog-fill" style="width:' + pct + '%"></div></div><span class="et-val">' + pct + '%</span></div>' +
+      '</div>';
+  }).join('');
+
+  var repCards = employees.map(function (emp) {
+    var empTasks = byEmp[emp.id] ? byEmp[emp.id].tasks : [];
+    var ms = empTasks.reduce(function (sum, task) {
+      return sum + (task.elapsed || 0) + (task.timerStart ? Date.now() - task.timerStart : 0);
+    }, 0);
+    var doneCount = empTasks.filter(function (task) { return task.status === 'done'; }).length;
+    var rows = empTasks.map(function (task) {
+      var taskMs = (task.elapsed || 0) + (task.timerStart ? Date.now() - task.timerStart : 0);
+      var cls = { todo: 'stag-todo', doing: 'stag-doing', done: 'stag-done' }[task.status];
+      var label = { todo: 'A Fazer', doing: 'Andamento', done: 'Concluído' }[task.status];
+      var flags = '';
+      if (task.status === 'done') {
+        if (task.needsRevisao) flags += tagBadge('Revisão', '#fff8e1', '#b8860b', '#f5c300');
+        if (task.needsProtocolo) flags += tagBadge('Protocolo', '#e8f8ef', '#27ae60', '#a8d5b5');
+        if (task.flagAgendei) flags += tagBadge('Agendado', '#e8f0fc', '#2d7be5', '#b0c8f0');
+        if (task.flagDispensa) flags += tagBadge('Dispensa', '#f3eafc', '#8e44ad', '#d5b8e8');
+        if (task.flagProtreal) flags += tagBadge('Prot.Real', '#e8f8ef', '#27ae60', '#a8d5b5');
+        if (task.flagNaoAplic) flags += tagBadge('N/A', '#f1f5f9', '#64748b', '#e2e8f0');
+        if (!flags) flags = '<span style="font-size:9px;color:#9aa5b4;margin-left:2px;font-style:italic">nenhuma marcação</span>';
+      }
+      return '<div class="rep-row"><span class="stag ' + cls + '">' + label + '</span><span class="rep-tname">' + esc(task.title) + '</span><span class="rep-time">' + fmtMs(taskMs) + '</span>' + (flags ? '<div style="width:100%;padding-left:56px;margin-top:2px;display:flex;flex-wrap:wrap;gap:2px">' + flags + '</div>' : '') + '</div>';
+    }).join('');
+    return '<div class="rep-card"><div class="rep-head"><div class="rep-av" style="background:' + emp.color + '">' + ini(emp.name) + '</div><div><div class="rep-nm">' + esc(emp.name) + '</div><div class="rep-mt">' + empTasks.length + ' tarefa' + (empTasks.length !== 1 ? 's' : '') + ' · ' + doneCount + ' concluída' + (doneCount !== 1 ? 's' : '') + ' · ' + fmtMs(ms) + '</div></div></div><div class="rep-tasks">' + (rows || '<div style="padding:8px;font-size:11px;color:var(--text-light)">Sem tarefas</div>') + '</div></div>';
+  }).join('');
+
+  var pwSection = '<div class="pw-section"><div class="pw-row">' +
+    '<div class="pw-field"><label>Nova senha</label><input id="pwNew" type="password" placeholder="Mínimo 6 caracteres" /></div>' +
+    '<div class="pw-field"><label>Confirmar</label><input id="pwConf" type="password" placeholder="Repita a senha" /></div>' +
+    '<button class="btn btn-purple btn-sm" onclick="changePw()">Salvar</button>' +
+    '</div></div>';
+
+  return '<div class="mgr-dashboard">' +
+    '<div class="mgr-hero">' +
+      '<div class="mgr-hero-copy">' +
+        '<div class="mgr-chip">Operação do gestor</div>' +
+        '<div class="mgr-heading">Painel executivo com assistência operacional e visão completa da equipe.</div>' +
+        '<div class="mgr-subheading">' + dateStr + '</div>' +
+      '</div>' +
+      '<div class="mgr-acts">' +
+        '<button class="btn btn-primary btn-sm" onclick="openUserModal()">+ Novo usuário</button>' +
+        '<button class="btn btn-amber btn-sm" onclick="closeDay()">Fechar o dia</button>' +
+        '<button class="btn btn-ghost btn-sm" onclick="exportReport()">Exportar relatório</button>' +
+      '</div>' +
+    '</div>' +
+    '<div class="session-bar">Sessão autenticada pelo login principal. O painel do gestor abre direto, sem segunda senha artificial.</div>' +
+    aiHtml +
+    kpis +
+    '<div class="section-title">Equipe e acessos</div>' +
+    usersHtml +
+    '<div class="section-title">Visão geral da equipe</div>' +
+    '<div class="emp-table"><div class="et-head"><span>Funcionário</span><span>Total</span><span>Ativo</span><span>Concluído</span><span>Progresso</span></div>' + (employeeRows || '<div style="padding:16px;text-align:center;color:var(--text-light);font-size:12px">Nenhuma tarefa.</div>') + '</div>' +
+    '<div class="section-title">Relatório por funcionário</div>' +
+    '<div class="rep-grid" style="margin-bottom:24px">' + (repCards || '<div style="font-size:12px;color:var(--text-light);padding:16px">Nenhuma tarefa ainda.</div>') + '</div>' +
+    '<div class="section-title">Histórico de dias</div>' +
+    historyHtml +
+    '<div class="section-title">Segurança</div>' +
     pwSection +
     '</div>';
 }
@@ -1444,7 +1708,7 @@ function checkAutoClose() {
       return refreshWorkspace(true);
     }).then(function () {
       renderTeam();
-      if (mgrUnlocked) renderMgr();
+      if (currentTab === 'mgr') renderMgr();
       showToast('Dia encerrado automaticamente (21h)');
     }).catch(function () {});
   }
@@ -1473,6 +1737,6 @@ document.addEventListener('keydown', function (event) {
 
 setInterval(function () { if (currentTab === 'all') renderAll(); }, 15000);
 setInterval(function () {
-  if (currentTab === 'mgr' && mgrUnlocked && !aiChatPending && !isManagerInteractionActive()) renderMgr();
+  if (currentTab === 'mgr' && !aiChatPending && !aiActionPending && !isManagerInteractionActive()) renderMgr();
 }, 10000);
 setInterval(updateDate, 60000);

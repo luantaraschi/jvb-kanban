@@ -230,11 +230,23 @@ async function runManagerChat(input) {
     type: 'object',
     additionalProperties: false,
     properties: {
+      mode: { type: 'string' },
       reply: { type: 'string' },
       suggestions: { type: 'array', items: { type: 'string' } },
-      alerts: { type: 'array', items: { type: 'string' } }
+      alerts: { type: 'array', items: { type: 'string' } },
+      pendingAction: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          type: { type: 'string' },
+          taskId: { type: 'string' },
+          reason: { type: 'string' },
+          payload: { type: 'object' }
+        },
+        required: ['type', 'reason', 'payload']
+      }
     },
-    required: ['reply', 'suggestions', 'alerts']
+    required: ['mode', 'reply', 'suggestions', 'alerts', 'pendingAction']
   };
 
   const messages = [];
@@ -252,19 +264,33 @@ async function runManagerChat(input) {
     systemPrompt:
       'Voce e um assistente operacional do painel do gestor em um escritorio de advocacia. ' +
       'Responda em portugues, de forma objetiva, pratica e com base apenas nos dados fornecidos. ' +
-      'Nao faca promessas sobre automacoes nao executadas. ' +
-      'Quando sugerir acoes, deixe claro que o gestor ainda precisa confirmar. ' +
+      'Voce pode preparar acoes estruturadas sobre tarefas, mas nunca executar nada. ' +
+      'Quando o pedido for apenas informacional, retorne mode="analysis" e pendingAction.type="none". ' +
+      'Quando o pedido pedir criacao, edicao, redistribuicao, mudanca de status ou exclusao de tarefa e houver dados suficientes, retorne mode="action" com pendingAction preenchido. ' +
+      'Toda acao exige confirmacao explicita do gestor. ' +
+      'Nao invente ids, tarefas ou usuarios. Use somente os ids do contexto. ' +
+      'Use um destes tipos de acao: none, create_task, update_task, change_status, reassign_task, delete_task. ' +
+      'Para localizar uma tarefa existente, prefira taskId. So use pendingAction quando estiver seguro. Se faltar informacao, faca uma pergunta em reply e deixe pendingAction.type="none". ' +
       'Contexto da equipe: ' + JSON.stringify({
         teamContext: context.meta,
-        employeeMetrics: context.employeeMetrics
+        employees: context.teamMembers,
+        employeeMetrics: context.employeeMetrics.map(toChatMetric),
+        currentTasks: context.currentTasks
       }),
     messages
   });
 
+  const pendingAction = sanitizePendingAction(result.pendingAction, context);
+  const actionPreview = pendingAction ? describePendingAction(pendingAction, context) : null;
+
   return {
+    mode: pendingAction ? 'action' : normalizeChatMode(result.mode),
     reply: result.reply,
     suggestions: ensureStringArray(result.suggestions),
-    alerts: ensureStringArray(result.alerts)
+    alerts: ensureStringArray(result.alerts),
+    requiresConfirmation: !!pendingAction,
+    pendingAction,
+    actionPreview
   };
 }
 
@@ -387,7 +413,23 @@ async function buildManagerContext(input) {
       currentTaskCount: currentTasks.rows.length,
       snapshotCount: snapshots.length
     },
-    employeeMetrics
+    employeeMetrics,
+    teamMembers: employees.rows.map((emp) => ({
+      userId: Number(emp.id),
+      name: emp.name
+    })),
+    currentTasks: currentTasks.rows.map((task) => ({
+      id: String(task.id),
+      title: task.title,
+      description: task.description,
+      assignedBy: task.assigned_by,
+      userId: Number(task.user_id),
+      empName: task.emp_name,
+      status: task.status,
+      elapsed: Number(task.elapsed || 0),
+      needsRevisao: !!task.needs_revisao,
+      needsProtocolo: !!task.needs_protocolo
+    }))
   };
 }
 
@@ -489,6 +531,189 @@ function extractGeminiText(payload) {
     return part.text;
   }
   return '';
+}
+
+function sanitizePendingAction(value, context) {
+  const action = value && typeof value === 'object' ? value : {};
+  const type = cleanText(action.type).toLowerCase();
+  const payload = action.payload && typeof action.payload === 'object' ? action.payload : {};
+  const reason = cleanText(action.reason) || 'Acao preparada pelo assistente com base no contexto atual.';
+  const employeeById = {};
+  const taskById = {};
+  const tasksByTitle = {};
+
+  context.teamMembers.forEach((member) => {
+    employeeById[member.userId] = member;
+  });
+  context.currentTasks.forEach((task) => {
+    taskById[String(task.id)] = task;
+    const titleKey = cleanText(task.title).toLowerCase();
+    if (!titleKey) return;
+    if (!tasksByTitle[titleKey]) tasksByTitle[titleKey] = [];
+    tasksByTitle[titleKey].push(task);
+  });
+
+  if (!type || type === 'none') return null;
+
+  if (type === 'create_task') {
+    const userId = Number(payload.userId || payload.assignedToUserId);
+    const employee = employeeById[userId];
+    const title = cleanText(payload.title);
+    if (!employee || !title) return null;
+    return {
+      type,
+      taskId: null,
+      reason,
+      payload: {
+        title,
+        description: cleanText(payload.description),
+        notes: cleanText(payload.notes),
+        assignedBy: cleanText(payload.assignedBy),
+        userId: employee.userId,
+        status: sanitizeTaskStatus(payload.status) || 'todo'
+      }
+    };
+  }
+
+  const task = resolveTaskReference(action.taskId, payload, taskById, tasksByTitle);
+  if (!task) return null;
+
+  if (type === 'delete_task') {
+    return {
+      type,
+      taskId: task.id,
+      reason,
+      payload: {}
+    };
+  }
+
+  if (type === 'change_status') {
+    const newStatus = sanitizeTaskStatus(payload.newStatus || payload.status);
+    if (!newStatus) return null;
+    return {
+      type,
+      taskId: task.id,
+      reason,
+      payload: {
+        newStatus,
+        needsRevisao: !!payload.needsRevisao,
+        needsProtocolo: !!payload.needsProtocolo,
+        flagAgendei: !!payload.flagAgendei,
+        flagDispensa: !!payload.flagDispensa,
+        flagProtreal: !!payload.flagProtreal,
+        flagNaoAplic: !!payload.flagNaoAplic
+      }
+    };
+  }
+
+  if (type === 'reassign_task') {
+    const userId = Number(payload.userId || payload.assignedToUserId);
+    const employee = employeeById[userId];
+    if (!employee) return null;
+    return {
+      type,
+      taskId: task.id,
+      reason,
+      payload: {
+        userId: employee.userId,
+        assignedBy: cleanText(payload.assignedBy)
+      }
+    };
+  }
+
+  if (type === 'update_task') {
+    const nextUserId = payload.userId != null || payload.assignedToUserId != null
+      ? Number(payload.userId || payload.assignedToUserId)
+      : task.userId;
+    const employee = employeeById[nextUserId];
+    if (!employee) return null;
+    const nextPayload = {};
+    if (payload.title != null) nextPayload.title = cleanText(payload.title);
+    if (payload.description != null) nextPayload.description = cleanText(payload.description);
+    if (payload.notes != null) nextPayload.notes = cleanText(payload.notes);
+    if (payload.assignedBy != null) nextPayload.assignedBy = cleanText(payload.assignedBy);
+    nextPayload.userId = employee.userId;
+    if (!Object.keys(nextPayload).length) return null;
+    return {
+      type,
+      taskId: task.id,
+      reason,
+      payload: nextPayload
+    };
+  }
+
+  return null;
+}
+
+function resolveTaskReference(taskId, payload, taskById, tasksByTitle) {
+  const explicitId = cleanText(taskId || payload.taskId);
+  if (explicitId && taskById[explicitId]) return taskById[explicitId];
+
+  const titleRef = cleanText(payload.targetTitle || payload.currentTitle || payload.title).toLowerCase();
+  if (!titleRef || !tasksByTitle[titleRef] || tasksByTitle[titleRef].length !== 1) return null;
+  return tasksByTitle[titleRef][0];
+}
+
+function describePendingAction(action, context) {
+  const task = action.taskId
+    ? context.currentTasks.filter((item) => String(item.id) === String(action.taskId))[0]
+    : null;
+  const employeeById = {};
+  context.teamMembers.forEach((member) => {
+    employeeById[member.userId] = member;
+  });
+  const nextOwner = employeeById[Number(action.payload && action.payload.userId)];
+  const labels = {
+    create_task: 'Criar tarefa',
+    update_task: 'Atualizar tarefa',
+    change_status: 'Alterar status',
+    reassign_task: 'Redistribuir tarefa',
+    delete_task: 'Excluir tarefa'
+  };
+  let summary = action.reason || '';
+
+  if (action.type === 'create_task') {
+    summary =
+      'Criar "' + action.payload.title + '" para ' +
+      (nextOwner ? nextOwner.name : 'responsavel selecionado') +
+      (action.payload.status && action.payload.status !== 'todo' ? ' com status ' + formatTaskStatus(action.payload.status) : '.');
+  } else if (action.type === 'update_task' && task) {
+    summary = 'Atualizar "' + task.title + '"' + (nextOwner && nextOwner.userId !== task.userId ? ' e mover para ' + nextOwner.name : '.') ;
+  } else if (action.type === 'change_status' && task) {
+    summary = 'Mover "' + task.title + '" para ' + formatTaskStatus(action.payload.newStatus) + '.';
+  } else if (action.type === 'reassign_task' && task) {
+    summary = 'Reatribuir "' + task.title + '" para ' + (nextOwner ? nextOwner.name : 'o novo responsavel') + '.';
+  } else if (action.type === 'delete_task' && task) {
+    summary = 'Excluir "' + task.title + '" de ' + task.empName + '.';
+  }
+
+  return {
+    label: labels[action.type] || 'Acao do assistente',
+    summary,
+    currentTaskTitle: task ? task.title : null,
+    currentAssignee: task ? task.empName : null,
+    nextAssignee: nextOwner ? nextOwner.name : null,
+    nextStatus: action.payload && action.payload.newStatus ? action.payload.newStatus : null
+  };
+}
+
+function toChatMetric(metric) {
+  return {
+    empId: metric.empId,
+    name: metric.name,
+    currentOpenCount: metric.currentOpenCount,
+    currentDoingCount: metric.currentDoingCount,
+    currentDoneCount: metric.currentDoneCount,
+    historicalDoneCount: metric.historicalDoneCount,
+    averageDoneMs: metric.averageDoneMs,
+    reviewFlags: metric.reviewFlags,
+    protocolFlags: metric.protocolFlags,
+    recentTitles: metric.recentTitles.slice(0, 5)
+  };
+}
+
+function normalizeChatMode(value) {
+  return cleanText(value).toLowerCase() === 'action' ? 'action' : 'analysis';
 }
 
 function stripCodeFence(value) {
@@ -670,6 +895,19 @@ function clampScore(value) {
   if (num < 1) return 1;
   if (num > 100) return 100;
   return Math.round(num);
+}
+
+function sanitizeTaskStatus(value) {
+  const status = cleanText(value).toLowerCase();
+  return ['todo', 'doing', 'done'].indexOf(status) !== -1 ? status : '';
+}
+
+function formatTaskStatus(value) {
+  return {
+    todo: 'A Fazer',
+    doing: 'Em andamento',
+    done: 'Concluida'
+  }[value] || value;
 }
 
 function ensureStringArray(value) {
