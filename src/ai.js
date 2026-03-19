@@ -84,18 +84,22 @@ async function suggestTaskAssignment(input) {
   const title = cleanText(input && input.title);
   const description = cleanText(input && input.description);
   const assignedBy = cleanText(input && input.assignedBy);
+  const taskBatch = Array.isArray(input && input.tasks) ? input.tasks : [];
   if (!title) {
-    const error = new Error('Titulo da tarefa obrigatorio');
-    error.status = 400;
-    throw error;
+    if (!taskBatch.length) {
+      const error = new Error('Titulo da tarefa obrigatorio');
+      error.status = 400;
+      throw error;
+    }
   }
 
   const context = await buildManagerContext({ period: '30d' });
-  const candidates = rankAssignmentCandidates({
+  const baseInput = {
     title,
     description,
     employees: context.employeeMetrics
-  }).slice(0, 5);
+  };
+  const candidates = (await buildAssignmentCandidates(baseInput)).slice(0, 5);
 
   const schema = {
     type: 'object',
@@ -142,8 +146,22 @@ async function suggestTaskAssignment(input) {
   return {
     summary: structured && structured.summary
       ? structured.summary
-      : 'Sugestao baseada em carga atual, historico de conclusao e afinidade com tarefas semelhantes.',
-    candidates: ranked
+      : 'Sugestao baseada em perfis por categoria, carga atual, historico de conclusao e afinidade com tarefas semelhantes.',
+    candidates: ranked,
+    batch: taskBatch.length ? await Promise.all(taskBatch.map(async (task) => {
+      const taskTitle = cleanText(task && task.title);
+      if (!taskTitle) return null;
+      const taskCandidates = (await buildAssignmentCandidates({
+        title: taskTitle,
+        description: cleanText(task && task.description),
+        employees: context.employeeMetrics
+      })).slice(0, 3);
+      return {
+        title: taskTitle,
+        description: cleanText(task && task.description),
+        candidates: taskCandidates
+      };
+    })).then((items) => items.filter(Boolean)) : []
   };
 }
 
@@ -429,7 +447,28 @@ async function buildManagerContext(input) {
       elapsed: Number(task.elapsed || 0),
       needsRevisao: !!task.needs_revisao,
       needsProtocolo: !!task.needs_protocolo
-    }))
+    })),
+    historicalTasks: snapshots.reduce((all, snapshot) => {
+      (snapshot.data.employees || []).forEach((item) => {
+        (item.tasks || []).forEach((task) => {
+          all.push({
+            id: String(snapshot.date + ':' + item.empId + ':' + cleanText(task.title)),
+            title: task.title,
+            description: task.description,
+            assignedBy: task.assignedBy,
+            userId: Number(item.empId),
+            empName: item.empName || 'Colaborador',
+            status: task.status,
+            elapsed: Number(task.elapsed || 0),
+            needsRevisao: !!task.needsRevisao,
+            needsProtocolo: !!task.needsProtocolo,
+            closedAt: snapshot.closedAt,
+            snapshotDate: snapshot.date
+          });
+        });
+      });
+      return all;
+    }, [])
   };
 }
 
@@ -776,6 +815,93 @@ function sanitizeTriageTasks(items, metrics) {
   }).filter((item) => item.assignedToUserId);
 }
 
+async function buildAssignmentCandidates(input) {
+  const persisted = await rankAssignmentCandidatesFromProfiles(input);
+  if (persisted.length) {
+    return persisted;
+  }
+  return rankAssignmentCandidates(input);
+}
+
+async function rankAssignmentCandidatesFromProfiles(input) {
+  const categories = detectAssignmentCategories(input.title, input.description);
+  if (!categories.length) return [];
+
+  const result = await query(
+    `
+      SELECT
+        employee_id,
+        employee_name,
+        category,
+        category_label,
+        score,
+        confidence,
+        done_count,
+        open_count,
+        doing_count,
+        avg_done_ms
+      FROM ai_performance_profiles
+      WHERE category = ANY($1::text[])
+    `,
+    [categories]
+  ).catch(() => ({ rows: [] }));
+
+  if (!result.rows.length) return [];
+
+  const grouped = {};
+  result.rows.forEach((row) => {
+    const empId = Number(row.employee_id);
+    if (!grouped[empId]) {
+      grouped[empId] = {
+        userId: empId,
+        name: row.employee_name,
+        score: 0,
+        reasons: [],
+        confidence: 0
+      };
+    }
+
+    grouped[empId].score += Number(row.score || 0);
+    grouped[empId].confidence += Number(row.confidence || 0);
+    grouped[empId].reasons.push(
+      row.category_label + ': score ' + row.score +
+      ', ' + row.done_count + ' concluida(s), ' +
+      row.open_count + ' aberta(s), ' +
+      row.doing_count + ' em andamento.'
+    );
+  });
+
+  return Object.keys(grouped).map((key) => {
+    const item = grouped[key];
+    return {
+      userId: item.userId,
+      name: item.name,
+      score: clampScore(Math.round(item.score / Math.max(categories.length, 1))),
+      reason: 'Perfis por categoria: ' + item.reasons.join(' ')
+    };
+  }).sort((a, b) => b.score - a.score);
+}
+
+function detectAssignmentCategories(title, description) {
+  const text = (cleanText(title) + ' ' + cleanText(description)).toLowerCase();
+  const rules = [
+    { category: 'protocolo', keywords: ['protocolo', 'protocolar', 'peticionamento', 'distribuicao'] },
+    { category: 'revisao', keywords: ['revisao', 'revisar', 'validar', 'corrigir'] },
+    { category: 'cumprimento', keywords: ['cumprimento', 'mandado', 'oficio', 'intimacao', 'prazo'] },
+    { category: 'peticao', keywords: ['peticao', 'manifestacao', 'contestacao', 'recurso', 'impugnacao'] },
+    { category: 'audiencia', keywords: ['audiencia', 'sessao', 'pauta'] },
+    { category: 'atendimento', keywords: ['cliente', 'atendimento', 'retorno', 'ligacao'] },
+    { category: 'financeiro', keywords: ['custas', 'guia', 'pagamento', 'deposito'] },
+    { category: 'administrativo', keywords: ['cadastro', 'arquivo', 'planilha', 'controle', 'relatorio'] }
+  ];
+
+  const matches = rules
+    .filter((rule) => rule.keywords.some((keyword) => text.indexOf(keyword) !== -1))
+    .map((rule) => rule.category);
+
+  return matches.length ? matches.slice(0, 2) : ['administrativo'];
+}
+
 function rankAssignmentCandidates(input) {
   const text = (input.title + ' ' + input.description).toLowerCase();
   const tokens = uniqueTokens(text);
@@ -920,6 +1046,7 @@ module.exports = {
   buildManagerContext,
   generateFeedback,
   isAiEnabled,
+  requestStructuredJson,
   runManagerChat,
   suggestTaskAssignment,
   triageInitial

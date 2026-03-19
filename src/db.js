@@ -74,11 +74,75 @@ const SCHEMA_SQL = `
 
   CREATE TABLE IF NOT EXISTS ai_runs (
     id BIGSERIAL PRIMARY KEY,
-    kind TEXT NOT NULL CHECK (kind IN ('feedback', 'assignment', 'initial_triage', 'chat')),
-    created_by_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL CHECK (kind IN ('feedback', 'assignment', 'initial_triage', 'chat', 'report_snapshot', 'pdf_intake', 'pdf_analysis')),
+    created_by_user_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
     input_json JSONB NOT NULL DEFAULT '{}'::jsonb,
     output_json JSONB,
     status TEXT NOT NULL DEFAULT 'completed' CHECK (status IN ('pending', 'completed', 'failed')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
+
+  CREATE TABLE IF NOT EXISTS ai_report_snapshots (
+    id BIGSERIAL PRIMARY KEY,
+    period TEXT NOT NULL CHECK (period IN ('today', '7d', '30d', 'history')),
+    source TEXT NOT NULL DEFAULT 'manual',
+    created_by_user_id BIGINT REFERENCES users(id) ON DELETE SET NULL,
+    report_json JSONB NOT NULL,
+    generated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
+
+  CREATE TABLE IF NOT EXISTS ai_performance_profiles (
+    id BIGSERIAL PRIMARY KEY,
+    employee_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    employee_name TEXT NOT NULL,
+    category TEXT NOT NULL,
+    category_label TEXT NOT NULL,
+    score INTEGER NOT NULL DEFAULT 1,
+    confidence INTEGER NOT NULL DEFAULT 1,
+    sample_size INTEGER NOT NULL DEFAULT 0,
+    done_count INTEGER NOT NULL DEFAULT 0,
+    open_count INTEGER NOT NULL DEFAULT 0,
+    doing_count INTEGER NOT NULL DEFAULT 0,
+    avg_done_ms BIGINT NOT NULL DEFAULT 0,
+    review_rate NUMERIC(6, 2) NOT NULL DEFAULT 0,
+    protocol_rate NUMERIC(6, 2) NOT NULL DEFAULT 0,
+    keyword_hits INTEGER NOT NULL DEFAULT 0,
+    metrics_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    source_snapshot_id BIGINT REFERENCES ai_report_snapshots(id) ON DELETE SET NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (employee_id, category)
+  );
+
+  CREATE TABLE IF NOT EXISTS ai_pending_documents (
+    id TEXT PRIMARY KEY,
+    filename TEXT NOT NULL,
+    mime_type TEXT NOT NULL DEFAULT 'application/pdf',
+    file_size BIGINT NOT NULL DEFAULT 0,
+    storage_bucket TEXT,
+    storage_path TEXT,
+    storage_status TEXT NOT NULL DEFAULT 'not_configured',
+    extracted_text TEXT NOT NULL DEFAULT '',
+    analysis_json JSONB,
+    status TEXT NOT NULL DEFAULT 'uploaded' CHECK (status IN ('uploaded', 'analyzed', 'applied', 'failed')),
+    created_by_user_id BIGINT REFERENCES users(id) ON DELETE SET NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    analyzed_at TIMESTAMPTZ,
+    applied_at TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
+
+  CREATE TABLE IF NOT EXISTS ai_pending_document_suggestions (
+    id BIGSERIAL PRIMARY KEY,
+    document_id TEXT NOT NULL REFERENCES ai_pending_documents(id) ON DELETE CASCADE,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    assigned_to_user_id BIGINT REFERENCES users(id) ON DELETE SET NULL,
+    assigned_to_name TEXT NOT NULL DEFAULT '',
+    category TEXT NOT NULL DEFAULT 'administrativo',
+    priority TEXT NOT NULL DEFAULT 'media',
+    reason TEXT NOT NULL DEFAULT '',
+    payload_json JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   );
 
@@ -88,6 +152,10 @@ const SCHEMA_SQL = `
   CREATE INDEX IF NOT EXISTS idx_task_activity_task_id ON task_activity(task_id);
   CREATE INDEX IF NOT EXISTS idx_task_activity_created_at ON task_activity(created_at DESC);
   CREATE INDEX IF NOT EXISTS idx_ai_runs_kind_created_at ON ai_runs(kind, created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_ai_report_snapshots_period_generated_at ON ai_report_snapshots(period, generated_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_ai_performance_profiles_employee ON ai_performance_profiles(employee_id, score DESC);
+  CREATE INDEX IF NOT EXISTS idx_ai_pending_documents_created_at ON ai_pending_documents(created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_ai_pending_document_suggestions_document ON ai_pending_document_suggestions(document_id, sort_order ASC);
 `;
 
 let pool;
@@ -192,6 +260,20 @@ async function bootstrapAdmin(client) {
 
 async function runSchemaUpgrades(client) {
   await client.query(`
+    ALTER TABLE ai_runs
+    DROP CONSTRAINT IF EXISTS ai_runs_kind_check
+  `);
+  await client.query(`
+    ALTER TABLE ai_runs
+    ADD CONSTRAINT ai_runs_kind_check
+    CHECK (kind IN ('feedback', 'assignment', 'initial_triage', 'chat', 'report_snapshot', 'pdf_intake', 'pdf_analysis'))
+  `).catch(() => {});
+  await client.query(`
+    ALTER TABLE ai_runs
+    ALTER COLUMN created_by_user_id DROP NOT NULL
+  `).catch(() => {});
+
+  await client.query(`
     ALTER TABLE tasks
     ADD COLUMN IF NOT EXISTS created_by_user_id BIGINT REFERENCES users(id)
   `);
@@ -215,6 +297,23 @@ async function runSchemaUpgrades(client) {
       updated_by_user_id IS NULL OR
       last_edited_at IS NULL
   `);
+
+  await client.query(`
+    ALTER TABLE ai_pending_documents
+    ADD COLUMN IF NOT EXISTS storage_bucket TEXT
+  `).catch(() => {});
+  await client.query(`
+    ALTER TABLE ai_pending_documents
+    ADD COLUMN IF NOT EXISTS storage_path TEXT
+  `).catch(() => {});
+  await client.query(`
+    ALTER TABLE ai_pending_documents
+    ADD COLUMN IF NOT EXISTS storage_status TEXT NOT NULL DEFAULT 'not_configured'
+  `).catch(() => {});
+  await client.query(`
+    ALTER TABLE ai_pending_documents
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  `).catch(() => {});
 }
 
 function normalizeUsername(value) {

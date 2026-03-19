@@ -9,6 +9,15 @@ const {
   suggestTaskAssignment,
   triageInitial
 } = require('./ai');
+const {
+  analyzePendingDocument,
+  createPendingDocument,
+  getLatestOperationalReport,
+  getPendingDocument,
+  listPendingDocuments,
+  listPerformanceProfiles,
+  refreshOperationalIntelligence
+} = require('./operational-intelligence');
 const { normalizeUsername, pickTheme, query, withTransaction } = require('./db');
 const { requireAuth, requireManager, signToken } = require('./auth');
 
@@ -542,10 +551,22 @@ router.post('/manager/ai/execute', requireManager, asyncHandler(async (req, res)
 }));
 
 router.post('/manager/ai/feedback', requireManager, asyncHandler(async (req, res) => {
-  const inputJson = { period: req.body.period };
+  const inputJson = {
+    period: req.body.period,
+    mode: cleanText(req.body.mode).toLowerCase() || 'latest'
+  };
 
   try {
-    const outputJson = await generateFeedback(inputJson);
+    let outputJson;
+    if (inputJson.mode !== 'refresh') {
+      const latest = await getLatestOperationalReport({ period: inputJson.period });
+      if (latest && latest.feedback) {
+        outputJson = Object.assign({ cached: true, snapshotId: latest.id, generatedAt: latest.generatedAt }, latest.feedback);
+      }
+    }
+    if (!outputJson) {
+      outputJson = await generateFeedback(inputJson);
+    }
     const run = await persistAiRun({
       kind: 'feedback',
       createdByUserId: req.user.id,
@@ -570,7 +591,11 @@ router.post('/manager/ai/task-assignment', requireManager, asyncHandler(async (r
   const inputJson = {
     title: cleanText(req.body.title),
     description: cleanText(req.body.description),
-    assignedBy: cleanText(req.body.assignedBy)
+    assignedBy: cleanText(req.body.assignedBy),
+    tasks: Array.isArray(req.body.tasks) ? req.body.tasks.slice(0, 20).map((task) => ({
+      title: cleanText(task && task.title),
+      description: cleanText(task && task.description)
+    })) : []
   };
 
   try {
@@ -593,6 +618,98 @@ router.post('/manager/ai/task-assignment', requireManager, asyncHandler(async (r
     });
     throw error;
   }
+}));
+
+router.get('/manager/ai/reports/latest', requireManager, asyncHandler(async (req, res) => {
+  const latest = await getLatestOperationalReport({ period: req.query.period });
+  if (!latest) {
+    return res.status(404).json({ error: 'Nenhum snapshot operacional encontrado para este periodo' });
+  }
+  res.json(Object.assign({ enabled: isAiEnabled() }, latest));
+}));
+
+router.post('/manager/ai/reports/refresh', requireManager, asyncHandler(async (req, res) => {
+  const snapshot = await refreshOperationalIntelligence({
+    period: req.body.period,
+    source: cleanText(req.body.source) || 'manual',
+    createdByUserId: req.user.id
+  });
+  res.json(Object.assign({ enabled: isAiEnabled() }, snapshot));
+}));
+
+router.get('/manager/ai/performance-profiles', requireManager, asyncHandler(async (req, res) => {
+  res.json(await listPerformanceProfiles());
+}));
+
+router.get('/manager/ai/pending-documents', requireManager, asyncHandler(async (req, res) => {
+  res.json(await listPendingDocuments());
+}));
+
+router.post('/manager/ai/pending-documents', requireManager, asyncHandler(async (req, res) => {
+  const document = await createPendingDocument({
+    createdByUserId: req.user.id,
+    filename: cleanText(req.body.filename),
+    mimeType: cleanText(req.body.mimeType),
+    contentBase64: cleanText(req.body.contentBase64)
+  });
+  res.status(201).json(document);
+}));
+
+router.get('/manager/ai/pending-documents/:id', requireManager, asyncHandler(async (req, res) => {
+  const document = await getPendingDocument(req.params.id);
+  if (!document) {
+    return res.status(404).json({ error: 'Documento nao encontrado' });
+  }
+  res.json(document);
+}));
+
+router.post('/manager/ai/pending-documents/:id/analyze', requireManager, asyncHandler(async (req, res) => {
+  const document = await analyzePendingDocument({
+    documentId: req.params.id,
+    createdByUserId: req.user.id
+  });
+  res.json(Object.assign({ enabled: isAiEnabled() }, document));
+}));
+
+router.post('/manager/ai/pending-documents/:id/apply-assignments', requireManager, asyncHandler(async (req, res) => {
+  const document = await getPendingDocument(req.params.id);
+  if (!document) {
+    return res.status(404).json({ error: 'Documento nao encontrado' });
+  }
+  if (!document.suggestions || !document.suggestions.length) {
+    return res.status(400).json({ error: 'Documento sem tarefas sugeridas para aplicar' });
+  }
+
+  const created = [];
+  for (const suggestion of document.suggestions) {
+    const task = await createTaskRecord({
+      actorUser: req.user,
+      data: {
+        title: suggestion.title,
+        description: suggestion.description,
+        assignedBy: (suggestion.payload && suggestion.payload.assignedBy) || req.user.name,
+        status: (suggestion.payload && suggestion.payload.status) || 'todo',
+        userId: suggestion.assignedToUserId
+      },
+      activityMeta: {
+        origin: 'assistant_pdf',
+        documentId: document.id,
+        confirmedByUserId: Number(req.user.id)
+      }
+    });
+    created.push(task);
+  }
+
+  await query(
+    `
+      UPDATE ai_pending_documents
+      SET status = 'applied', applied_at = NOW(), updated_at = NOW()
+      WHERE id = $1
+    `,
+    [document.id]
+  );
+
+  res.status(201).json({ ok: true, created });
 }));
 
 router.post('/manager/ai/initial-triage', requireManager, asyncHandler(async (req, res) => {

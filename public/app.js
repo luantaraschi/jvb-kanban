@@ -8,6 +8,9 @@ var activeId = null;
 var timers = {};
 var dragId = null;
 var currentTab = 'team';
+var tasksViewStatus = 'all';
+var tasksViewSearch = '';
+var tasksViewEmp = '';
 var histFilterEmp = '';
 var histFilterDate = '';
 var historyData = [];
@@ -31,6 +34,19 @@ var aiActionPending = false;
 var aiAssignmentDraft = { title: '', description: '', assignedBy: '' };
 var aiInitialDraft = { title: '', initialText: '', contextNote: '' };
 var aiChatDraft = '';
+var aiOperationalPeriod = '7d';
+var aiOperationalSnapshot = null;
+var aiOperationalLoading = false;
+var aiProfilesState = { updatedAt: null, employees: [] };
+var aiProfilesLoading = false;
+var aiDocuments = [];
+var aiDocumentsLoading = false;
+var aiDocumentDetail = null;
+var aiDocumentActiveId = null;
+var aiDocumentUploading = false;
+var aiDocumentAnalyzing = false;
+var aiDocumentApplying = false;
+var aiOperationalLoadedAt = 0;
 
 function apiHeaders() {
   var headers = { 'Content-Type': 'application/json' };
@@ -266,6 +282,51 @@ function findManagerUser(id) {
   return null;
 }
 
+function countTasksByStatus(status) {
+  if (status === 'all') return tasks.length;
+  return tasks.filter(function (task) { return task.status === status; }).length;
+}
+
+function getOpenTasksByEmployee(empId) {
+  return tasks.filter(function (task) {
+    return task.empId === empId && task.status !== 'done';
+  });
+}
+
+function getPreferredTaskEmpId() {
+  if (tasksViewEmp && findEmp(Number(tasksViewEmp))) return Number(tasksViewEmp);
+  if (activeId && findEmp(activeId)) return activeId;
+  if (currentUser && currentUser.role === 'employee' && findEmp(currentUser.id)) return currentUser.id;
+  return employees[0] ? employees[0].id : null;
+}
+
+function getTaskElapsedMs(task) {
+  return (task.elapsed || 0) + (task.timerStart ? Date.now() - task.timerStart : 0);
+}
+
+function taskMatchesFilters(task) {
+  var search = String(tasksViewSearch || '').trim().toLowerCase();
+  var byStatus = tasksViewStatus === 'all' || task.status === tasksViewStatus;
+  var byEmp = !tasksViewEmp || String(task.empId) === String(tasksViewEmp);
+  var haystack = [
+    task.title,
+    task.desc,
+    task.empName,
+    task.assignedBy,
+    task.createdByName,
+    task.updatedByName
+  ].join(' ').toLowerCase();
+  var bySearch = !search || haystack.indexOf(search) !== -1;
+  return byStatus && byEmp && bySearch;
+}
+
+function rerenderOperationalViews() {
+  renderTeam();
+  if (currentTab === 'all') renderAll();
+  if (currentTab === 'tasks') renderTasksView();
+  if (currentTab === 'mgr') renderMgr();
+}
+
 function getEmpColors(empId) {
   var emp = findEmp(empId);
   if (emp) return { colBg: emp.colBg || emp.col_bg, boardBg: emp.boardBg || emp.board_bg, pastel: emp.pastel };
@@ -333,13 +394,16 @@ function resetTimers() {
 function switchTab(tab) {
   currentTab = tab;
   document.getElementById('view-all').style.display = tab === 'all' ? 'block' : 'none';
+  document.getElementById('view-tasks').style.display = tab === 'tasks' ? 'block' : 'none';
   document.getElementById('view-team').style.display = tab === 'team' ? 'block' : 'none';
   document.getElementById('view-mgr').style.display = tab === 'mgr' ? 'block' : 'none';
   document.getElementById('tab-all').classList.toggle('active', tab === 'all');
+  document.getElementById('tab-tasks').classList.toggle('active', tab === 'tasks');
   document.getElementById('tab-team').classList.toggle('active', tab === 'team');
   document.getElementById('tab-mgr').classList.toggle('active', tab === 'mgr');
   renderSidebar();
   if (tab === 'all') renderAll();
+  if (tab === 'tasks') renderTasksView();
   if (tab === 'mgr') renderMgr();
 }
 
@@ -349,7 +413,7 @@ function selectEmp(empId) {
 }
 
 function openAdd(col) {
-  var empId = activeId;
+  var empId = currentTab === 'tasks' ? getPreferredTaskEmpId() : activeId;
   var emp = findEmp(empId);
   var empName = emp ? emp.name : '';
   if (!empName) {
@@ -393,9 +457,7 @@ async function addTask() {
     tasks.unshift(task);
     if (task.status === 'doing') startTimer(task.id);
     activeId = task.empId;
-    renderTeam();
-    if (currentTab === 'all') renderAll();
-    if (currentTab === 'mgr') renderMgr();
+    rerenderOperationalViews();
     overlayClose('addModal');
     showToast('Tarefa criada');
   } catch (error) {
@@ -408,9 +470,7 @@ async function deleteTask(id) {
     await api('DELETE', '/tasks/' + id);
     stopTimerLocal(id);
     tasks = tasks.filter(function (task) { return task.id !== id; });
-    renderTeam();
-    if (currentTab === 'all') renderAll();
-    if (currentTab === 'mgr') renderMgr();
+    rerenderOperationalViews();
     showToast('Tarefa removida');
   } catch (error) {
     showToast(error.message);
@@ -435,9 +495,7 @@ async function doChangeStatus(id, nextStatus, flags) {
     if (index !== -1) tasks[index] = updated;
     if (nextStatus === 'doing') startTimer(id);
     else stopTimerLocal(id);
-    renderTeam();
-    if (currentTab === 'all') renderAll();
-    if (currentTab === 'mgr') renderMgr();
+    rerenderOperationalViews();
   } catch (error) {
     showToast(error.message);
   }
@@ -531,9 +589,7 @@ async function saveEdit() {
     var index = tasks.findIndex(function (task) { return task.id === editingId; });
     if (index !== -1) tasks[index] = updated;
     activeId = updated.empId;
-    renderTeam();
-    if (currentTab === 'all') renderAll();
-    if (currentTab === 'mgr') renderMgr();
+    rerenderOperationalViews();
     overlayClose('editModal');
     showToast('Tarefa atualizada');
   } catch (error) {
@@ -703,46 +759,49 @@ function dEnd(event) {
   dragId = null;
   event.currentTarget.classList.remove('dragging');
   document.querySelectorAll('.drop-ph').forEach(function (placeholder) { placeholder.style.display = 'none'; });
+  document.querySelectorAll('.all-drop-ph').forEach(function (placeholder) { placeholder.style.display = 'none'; });
   document.querySelectorAll('.col').forEach(function (col) { col.classList.remove('drag-over'); });
+  document.querySelectorAll('.all-emp-col').forEach(function (col) { col.classList.remove('drag-over'); });
 }
 
 async function renderAll() {
   var panel = document.getElementById('view-all');
   if (!panel) return;
   var now = new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
-
-  try {
-    employees = await api('GET', '/team');
-  } catch (error) {}
-
   var cols = employees.map(function (emp) {
     var color = emp.color || '#888';
     var colBg = emp.colBg || '#f4f8fe';
-    var doingTasks = (emp.tasks || []).filter(function (task) { return task.status === 'doing'; });
-    var todoTasks = (emp.tasks || []).filter(function (task) { return task.status === 'todo'; });
+    var openTasks = getOpenTasksByEmployee(emp.id);
+    var doingTasks = openTasks.filter(function (task) { return task.status === 'doing'; });
     var badge = doingTasks.length > 0
-      ? '<span class="doing-badge">Em andamento</span>'
+      ? '<span class="doing-badge">' + doingTasks.length + ' em andamento</span>'
       : '<span class="idle-badge">Aguardando</span>';
-    var cards = '';
-    doingTasks.forEach(function (task) {
-      cards += '<div class="all-task-card doing"><div class="all-task-title">' + esc(task.title) + '</div>' +
-        (task.desc ? '<div class="all-task-sub">' + esc(task.desc.length > 60 ? task.desc.slice(0, 60) + '...' : task.desc) + '</div>' : '') +
-        (task.assignedBy ? '<div class="all-task-sub">👤 ' + esc(task.assignedBy) + '</div>' : '') +
-        '</div>';
-    });
-    todoTasks.forEach(function (task) {
-      cards += '<div class="all-task-card todo"><div class="all-task-title">' + esc(task.title) + '</div>' +
-        (task.assignedBy ? '<div class="all-task-sub">👤 ' + esc(task.assignedBy) + '</div>' : '') +
-        '</div>';
-    });
-    if (!cards) cards = '<div class="all-empty">Sem tarefas abertas</div>';
+    var cards = openTasks.length
+      ? openTasks.map(function (task) {
+        return '<div class="all-task-card ' + task.status + '" draggable="true" data-task-id="' + task.id + '" ondragstart="dStart(event,\'' + task.id + '\')" ondragend="dEnd(event)">' +
+          '<div class="all-task-head">' +
+          '<div class="all-task-title">' + esc(task.title) + '</div>' +
+          '<div class="all-task-mini-actions">' +
+          '<button class="card-edit" style="opacity:1;position:static" onclick="openEdit(\'' + task.id + '\')">✎</button>' +
+          '<button class="card-del" style="opacity:1;position:static" onclick="deleteTask(\'' + task.id + '\')">✕</button>' +
+          '</div>' +
+          '</div>' +
+          (task.desc ? '<div class="all-task-sub">' + esc(task.desc.length > 88 ? task.desc.slice(0, 88) + '...' : task.desc) + '</div>' : '') +
+          '<div class="all-task-meta">' +
+          '<span>Designado por ' + esc(task.assignedBy || '—') + '</span>' +
+          '<span>' + esc(task.status === 'doing' ? 'Em andamento' : 'A fazer') + '</span>' +
+          '</div>' +
+          (buildFlagTags(task) ? '<div class="all-task-flags">' + buildFlagTags(task) + '</div>' : '') +
+          '</div>';
+      }).join('')
+      : '<div class="all-empty">Sem tarefas abertas</div>';
 
-    return '<div class="all-emp-col" style="border-top:3px solid ' + color + '">' +
+    return '<div class="all-emp-col" data-emp-drop="' + emp.id + '" style="border-top:3px solid ' + color + '">' +
       '<div class="all-emp-head" style="background:' + colBg + '">' +
       '<div class="all-emp-av" style="background:' + color + '">' + ini(emp.name) + '</div>' +
       '<div><div class="all-emp-name">' + esc(emp.name) + '</div><div class="all-emp-status">' + badge + '</div></div>' +
       '</div>' +
-      '<div class="all-task-list">' + cards + '</div>' +
+      '<div class="all-task-list"><div class="all-drop-ph">Solte aqui para reatribuir</div>' + cards + '</div>' +
       '</div>';
   }).join('');
 
@@ -754,6 +813,131 @@ async function renderAll() {
     '</div>' +
     '<div class="all-grid">' + cols + '</div>' +
     '</div>';
+
+  bindAllViewDropzones();
+}
+
+function bindAllViewDropzones() {
+  document.querySelectorAll('[data-emp-drop]').forEach(function (dropzone) {
+    var empId = Number(dropzone.getAttribute('data-emp-drop'));
+    dropzone.addEventListener('dragover', function (event) {
+      event.preventDefault();
+      dropzone.classList.add('drag-over');
+      var ph = dropzone.querySelector('.all-drop-ph');
+      if (ph) ph.style.display = 'flex';
+    });
+    dropzone.addEventListener('dragleave', function (event) {
+      if (!dropzone.contains(event.relatedTarget)) {
+        dropzone.classList.remove('drag-over');
+        var ph = dropzone.querySelector('.all-drop-ph');
+        if (ph) ph.style.display = 'none';
+      }
+    });
+    dropzone.addEventListener('drop', function (event) {
+      event.preventDefault();
+      dropzone.classList.remove('drag-over');
+      var ph = dropzone.querySelector('.all-drop-ph');
+      if (ph) ph.style.display = 'none';
+      if (!dragId) return;
+      reassignTaskToEmployee(dragId, empId);
+    });
+  });
+}
+
+async function reassignTaskToEmployee(taskId, empId) {
+  var task = findTask(taskId);
+  if (!task || Number(task.empId) === Number(empId)) return;
+
+  try {
+    var updated = await api('PUT', '/tasks/' + taskId, {
+      title: task.title,
+      description: task.desc || '',
+      notes: task.notes || '',
+      assignedBy: task.assignedBy || '',
+      userId: empId
+    });
+    var index = tasks.findIndex(function (item) { return item.id === taskId; });
+    if (index !== -1) tasks[index] = updated;
+    activeId = updated.empId;
+    rerenderOperationalViews();
+    showToast('Tarefa redistribuida para ' + updated.empName);
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
+function renderTasksView() {
+  var panel = document.getElementById('view-tasks');
+  if (!panel) return;
+
+  var filtered = tasks.filter(taskMatchesFilters);
+  var empOptions = ['<option value="">Todos os responsaveis</option>'].concat(
+    employees.map(function (emp) {
+      return '<option value="' + emp.id + '"' + (String(tasksViewEmp) === String(emp.id) ? ' selected' : '') + '>' + esc(emp.name) + '</option>';
+    })
+  ).join('');
+
+  var cards = filtered.length
+    ? filtered.map(function (task) {
+      var flags = buildFlagTags(task);
+      return '<div class="task-hub-card status-' + task.status + '">' +
+        '<div class="task-hub-head">' +
+        '<div>' +
+        '<div class="task-hub-title">' + esc(task.title) + '</div>' +
+        '<div class="task-hub-sub">Responsavel: ' + esc(task.empName || '—') + ' · Designado por ' + esc(task.assignedBy || '—') + '</div>' +
+        '</div>' +
+        '<span class="task-hub-status">' + esc(task.status === 'todo' ? 'A fazer' : task.status === 'doing' ? 'Em progresso' : 'Concluida') + '</span>' +
+        '</div>' +
+        (task.desc ? '<div class="task-hub-desc">' + esc(task.desc) + '</div>' : '') +
+        '<div class="task-hub-meta">' +
+        '<span>Tempo: ' + fmtMs(getTaskElapsedMs(task)) + '</span>' +
+        '<span>Criada por ' + esc(task.createdByName || '—') + '</span>' +
+        '<span>Ultima edicao ' + esc(task.updatedByName || '—') + (task.lastEditedAt ? ' · ' + esc(fmtDateTime(task.lastEditedAt)) : '') + '</span>' +
+        '</div>' +
+        (flags ? '<div class="task-hub-flags">' + flags + '</div>' : '') +
+        '<div class="task-hub-actions">' +
+        '<button class="btn btn-ghost btn-sm" onclick="openEdit(\'' + task.id + '\')">Editar</button>' +
+        '<button class="btn btn-ghost btn-sm" onclick="changeStatus(\'' + task.id + '\',\'todo\')">A fazer</button>' +
+        '<button class="btn btn-ghost btn-sm" onclick="changeStatus(\'' + task.id + '\',\'doing\')">Em progresso</button>' +
+        '<button class="btn btn-amber btn-sm" onclick="changeStatus(\'' + task.id + '\',\'done\')">Concluir</button>' +
+        '<button class="btn btn-danger btn-sm" onclick="deleteTask(\'' + task.id + '\')">Excluir</button>' +
+        '</div>' +
+        '</div>';
+    }).join('')
+    : '<div class="task-hub-empty">Nenhuma tarefa encontrada com os filtros atuais.</div>';
+
+  panel.innerHTML =
+    '<div class="task-hub">' +
+    '<div class="task-hub-topbar">' +
+    '<div><div class="task-hub-heading">Central de Tarefas</div><div class="task-hub-copy">Visualize, filtre e opere qualquer tarefa do sistema em uma unica tela.</div></div>' +
+    '<button class="btn btn-primary btn-sm" onclick="openAdd(\'todo\')">+ Nova Tarefa</button>' +
+    '</div>' +
+    '<div class="task-hub-stats">' +
+    buildTaskStat('Todas', 'all') +
+    buildTaskStat('A fazer', 'todo') +
+    buildTaskStat('Em progresso', 'doing') +
+    buildTaskStat('Concluidas', 'done') +
+    '</div>' +
+    '<div class="task-hub-filters">' +
+    '<input class="task-hub-search" value="' + esc(tasksViewSearch) + '" oninput="tasksViewSearch=this.value;renderTasksView()" placeholder="Buscar por titulo, descricao, responsavel ou designante" />' +
+    '<select class="task-hub-select" onchange="tasksViewEmp=this.value;renderTasksView()">' + empOptions + '</select>' +
+    '<select class="task-hub-select" onchange="tasksViewStatus=this.value;renderTasksView()">' +
+    '<option value="all"' + (tasksViewStatus === 'all' ? ' selected' : '') + '>Todos os status</option>' +
+    '<option value="todo"' + (tasksViewStatus === 'todo' ? ' selected' : '') + '>A fazer</option>' +
+    '<option value="doing"' + (tasksViewStatus === 'doing' ? ' selected' : '') + '>Em progresso</option>' +
+    '<option value="done"' + (tasksViewStatus === 'done' ? ' selected' : '') + '>Concluidas</option>' +
+    '</select>' +
+    '</div>' +
+    '<div class="task-hub-grid">' + cards + '</div>' +
+    '</div>';
+}
+
+function buildTaskStat(label, status) {
+  var active = tasksViewStatus === status;
+  return '<button class="task-hub-stat' + (active ? ' active' : '') + '" onclick="tasksViewStatus=\'' + status + '\';renderTasksView()">' +
+    '<span>' + esc(label) + '</span>' +
+    '<strong>' + countTasksByStatus(status) + '</strong>' +
+    '</button>';
 }
 
 function renderMgr() {
@@ -1070,7 +1254,7 @@ async function runAiFeedback() {
   aiFeedbackLoading = true;
   renderMgr();
   try {
-    aiFeedbackResult = await api('POST', '/manager/ai/feedback', { period: aiFeedbackPeriod });
+    aiFeedbackResult = await api('POST', '/manager/ai/feedback', { period: aiFeedbackPeriod, mode: 'refresh' });
   } catch (error) {
     showToast(error.message);
   } finally {
@@ -1155,9 +1339,7 @@ async function confirmAiPendingAction() {
     aiChatMessages.push({ role: 'assistant', content: result.message || 'Ação executada com sucesso.' });
     aiPendingAction = null;
     await refreshWorkspace(true);
-    renderTeam();
-    if (currentTab === 'all') renderAll();
-    if (currentTab === 'mgr') renderMgr();
+    rerenderOperationalViews();
     showToast('Ação confirmada');
   } catch (error) {
     showToast(error.message);
@@ -1203,12 +1385,325 @@ async function createInitialTasksFromAi() {
   try {
     await api('POST', '/manager/ai/initial-triage/' + aiInitialResult.runId + '/create-tasks');
     await refreshWorkspace(true);
-    renderTeam();
-    renderMgr();
+    rerenderOperationalViews();
     showToast('Tarefas sugeridas criadas');
   } catch (error) {
     showToast(error.message);
   }
+}
+
+async function ensureOperationalAiData(forceRefresh) {
+  if (!currentUser || currentUser.role !== 'manager') return;
+  if (aiOperationalLoading && !forceRefresh) return;
+  var stale = Date.now() - aiOperationalLoadedAt > 60000;
+  if (!forceRefresh && aiOperationalLoadedAt && !stale) return;
+
+  try {
+    aiOperationalLoading = true;
+    aiProfilesLoading = true;
+    aiDocumentsLoading = true;
+    if (currentTab === 'mgr') renderMgr();
+
+    var snapshot;
+    try {
+      snapshot = await api('GET', '/manager/ai/reports/latest?period=' + encodeURIComponent(aiOperationalPeriod));
+    } catch (error) {
+      snapshot = await api('POST', '/manager/ai/reports/refresh', {
+        period: aiOperationalPeriod,
+        source: forceRefresh ? 'manual_force' : 'manual_boot'
+      });
+    }
+
+    aiOperationalSnapshot = snapshot;
+    aiProfilesState = await api('GET', '/manager/ai/performance-profiles');
+    aiDocuments = await api('GET', '/manager/ai/pending-documents');
+
+    if (aiDocumentActiveId) {
+      try {
+        aiDocumentDetail = await api('GET', '/manager/ai/pending-documents/' + aiDocumentActiveId);
+      } catch (error) {
+        aiDocumentDetail = null;
+        aiDocumentActiveId = null;
+      }
+    } else if (aiDocuments.length) {
+      aiDocumentActiveId = aiDocuments[0].id;
+      aiDocumentDetail = await api('GET', '/manager/ai/pending-documents/' + aiDocumentActiveId);
+    }
+
+    aiOperationalLoadedAt = Date.now();
+  } catch (error) {
+    showToast(error.message);
+  } finally {
+    aiOperationalLoading = false;
+    aiProfilesLoading = false;
+    aiDocumentsLoading = false;
+    if (currentTab === 'mgr') renderMgr();
+  }
+}
+
+async function refreshOperationalSnapshot() {
+  if (aiOperationalLoading) return;
+  aiOperationalLoading = true;
+  renderMgr();
+  try {
+    aiOperationalSnapshot = await api('POST', '/manager/ai/reports/refresh', {
+      period: aiOperationalPeriod,
+      source: 'manual_refresh'
+    });
+    aiProfilesState = await api('GET', '/manager/ai/performance-profiles');
+    aiOperationalLoadedAt = Date.now();
+    showToast('Inteligencia operacional atualizada');
+  } catch (error) {
+    showToast(error.message);
+  } finally {
+    aiOperationalLoading = false;
+    renderMgr();
+  }
+}
+
+async function changeOperationalPeriod(value) {
+  aiOperationalPeriod = value || '7d';
+  aiOperationalLoadedAt = 0;
+  await ensureOperationalAiData(true);
+}
+
+async function openPendingDocument(id) {
+  aiDocumentActiveId = id;
+  aiDocumentsLoading = true;
+  renderMgr();
+  try {
+    aiDocumentDetail = await api('GET', '/manager/ai/pending-documents/' + id);
+  } catch (error) {
+    showToast(error.message);
+  } finally {
+    aiDocumentsLoading = false;
+    renderMgr();
+  }
+}
+
+async function handleAiPdfSelected(event) {
+  var file = event && event.target && event.target.files && event.target.files[0];
+  if (!file) return;
+  if (!/pdf$/i.test(file.name)) {
+    showToast('Selecione um PDF valido');
+    return;
+  }
+
+  aiDocumentUploading = true;
+  renderMgr();
+  try {
+    var contentBase64 = await readFileAsDataUrl(file);
+    var document = await api('POST', '/manager/ai/pending-documents', {
+      filename: file.name,
+      mimeType: file.type || 'application/pdf',
+      contentBase64: contentBase64
+    });
+    aiDocumentActiveId = document.id;
+    aiDocuments = await api('GET', '/manager/ai/pending-documents');
+    aiDocumentDetail = await api('GET', '/manager/ai/pending-documents/' + document.id);
+    aiOperationalLoadedAt = Date.now();
+    showToast('PDF enviado e registrado');
+  } catch (error) {
+    showToast(error.message);
+  } finally {
+    aiDocumentUploading = false;
+    renderMgr();
+  }
+}
+
+async function analyzeActivePendingDocument() {
+  if (!aiDocumentActiveId || aiDocumentAnalyzing) return;
+  aiDocumentAnalyzing = true;
+  renderMgr();
+  try {
+    aiDocumentDetail = await api('POST', '/manager/ai/pending-documents/' + aiDocumentActiveId + '/analyze');
+    aiDocuments = await api('GET', '/manager/ai/pending-documents');
+    aiOperationalLoadedAt = Date.now();
+    showToast('PDF analisado com sucesso');
+  } catch (error) {
+    showToast(error.message);
+  } finally {
+    aiDocumentAnalyzing = false;
+    renderMgr();
+  }
+}
+
+async function applyActivePendingAssignments() {
+  if (!aiDocumentActiveId || aiDocumentApplying) return;
+  aiDocumentApplying = true;
+  renderMgr();
+  try {
+    await api('POST', '/manager/ai/pending-documents/' + aiDocumentActiveId + '/apply-assignments');
+    await refreshWorkspace(true);
+    aiDocuments = await api('GET', '/manager/ai/pending-documents');
+    aiDocumentDetail = await api('GET', '/manager/ai/pending-documents/' + aiDocumentActiveId);
+    aiOperationalLoadedAt = 0;
+    showToast('Tarefas do PDF aplicadas');
+  } catch (error) {
+    showToast(error.message);
+  } finally {
+    aiDocumentApplying = false;
+    renderMgr();
+  }
+}
+
+function readFileAsDataUrl(file) {
+  return new Promise(function (resolve, reject) {
+    var reader = new FileReader();
+    reader.onload = function () { resolve(reader.result); };
+    reader.onerror = function () { reject(new Error('Falha ao ler o arquivo')); };
+    reader.readAsDataURL(file);
+  });
+}
+
+function buildOperationalIntelSection() {
+  var snapshot = aiOperationalSnapshot;
+  var summaryHtml = aiOperationalLoading
+    ? '<div class="ai-result-empty">Atualizando snapshot operacional...</div>'
+    : snapshot
+      ? '<div class="ai-op-summary">' +
+        '<div class="ai-op-lead">' + esc(snapshot.executiveSummary || '') + '</div>' +
+        '<div class="ai-op-meta">' +
+          '<span><strong>Periodo:</strong> ' + esc(formatOperationalPeriod(snapshot.period)) + '</span>' +
+          '<span><strong>Atualizado:</strong> ' + esc(fmtDateTime(snapshot.generatedAt)) + '</span>' +
+          '<span><strong>Origem:</strong> ' + esc(snapshot.source || 'manual') + '</span>' +
+        '</div>' +
+        buildMiniList('Alertas ativos', snapshot.alerts) +
+        buildMiniList('Recomendacoes', snapshot.recommendations) +
+        buildMiniList('Notas de carga', snapshot.loadNotes) +
+        buildSpecialistsGrid(snapshot.topSpecialists || []) +
+        buildRedistributionGrid(snapshot.redistributionCandidates || []) +
+        '</div>'
+      : '<div class="ai-result-empty">Nenhum snapshot operacional persistido ainda.</div>';
+
+  return '<section class="ai-op-shell">' +
+    '<div class="ai-op-card">' +
+      '<div class="ai-tool-head">' +
+        '<strong>Inteligencia operacional</strong>' +
+        '<div class="ai-inline-actions">' +
+          '<select class="ai-select" onchange="changeOperationalPeriod(this.value)">' +
+            '<option value="today"' + (aiOperationalPeriod === 'today' ? ' selected' : '') + '>Hoje</option>' +
+            '<option value="7d"' + (aiOperationalPeriod === '7d' ? ' selected' : '') + '>7 dias</option>' +
+            '<option value="30d"' + (aiOperationalPeriod === '30d' ? ' selected' : '') + '>30 dias</option>' +
+            '<option value="history"' + (aiOperationalPeriod === 'history' ? ' selected' : '') + '>Historico</option>' +
+          '</select>' +
+          '<button class="btn btn-primary btn-sm" onclick="refreshOperationalSnapshot()">' + (aiOperationalLoading ? 'Atualizando...' : 'Recalcular agora') + '</button>' +
+        '</div>' +
+      '</div>' +
+      summaryHtml +
+    '</div>' +
+    '<div class="ai-op-grid">' +
+      '<div class="ai-tool-card">' +
+        '<div class="ai-tool-head"><strong>Perfis por especialidade</strong>' +
+        '<span class="ai-status-note">' + (aiProfilesState.updatedAt ? 'Atualizado em ' + esc(fmtDateTime(aiProfilesState.updatedAt)) : 'Sem snapshot') + '</span></div>' +
+        '<div class="ai-tool-body">' + buildProfilesPanel() + '</div>' +
+      '</div>' +
+      '<div class="ai-tool-card">' +
+        '<div class="ai-tool-head"><strong>PDF de pendencias</strong>' +
+        '<label class="btn btn-ghost btn-sm" for="aiPdfInput">' + (aiDocumentUploading ? 'Enviando...' : 'Enviar PDF') + '</label>' +
+        '<input id="aiPdfInput" type="file" accept="application/pdf" style="display:none" onchange="handleAiPdfSelected(event)" />' +
+        '</div>' +
+        '<div class="ai-tool-body">' + buildPendingDocumentsPanel() + '</div>' +
+      '</div>' +
+    '</div>' +
+  '</section>';
+}
+
+function buildProfilesPanel() {
+  if (aiProfilesLoading) return '<div class="ai-result-empty">Carregando perfis...</div>';
+  if (!aiProfilesState || !aiProfilesState.employees || !aiProfilesState.employees.length) {
+    return '<div class="ai-result-empty">Perfis ainda nao calculados. Gere um snapshot para popular essa camada.</div>';
+  }
+
+  return '<div class="ai-result-grid">' + aiProfilesState.employees.map(function (employee) {
+    var topProfiles = (employee.profiles || []).slice(0, 3);
+    return '<div class="ai-mini-card">' +
+      '<div class="ai-mini-title">' + esc(employee.name) + '<span>' + topProfiles.length + ' destaque(s)</span></div>' +
+      topProfiles.map(function (profile) {
+        return '<div class="ai-profile-row">' +
+          '<strong>' + esc(profile.categoryLabel) + '</strong>' +
+          '<span>score ' + esc(profile.score) + ' · conf. ' + esc(profile.confidence) + '</span>' +
+          '<small>' + esc(profile.doneCount) + ' concluidas · ' + esc(profile.openCount) + ' abertas</small>' +
+          '</div>';
+      }).join('') +
+    '</div>';
+  }).join('') + '</div>';
+}
+
+function buildPendingDocumentsPanel() {
+  var listHtml = aiDocumentsLoading
+    ? '<div class="ai-result-empty">Carregando documentos...</div>'
+    : aiDocuments.length
+      ? '<div class="ai-doc-list">' + aiDocuments.map(function (doc) {
+        var active = aiDocumentActiveId === doc.id ? ' active' : '';
+        return '<button class="ai-doc-item' + active + '" onclick="openPendingDocument(\'' + doc.id + '\')">' +
+          '<strong>' + esc(doc.filename) + '</strong>' +
+          '<span>' + esc(doc.status) + ' · ' + esc(fmtDateTime(doc.createdAt)) + '</span>' +
+        '</button>';
+      }).join('') + '</div>'
+      : '<div class="ai-result-empty">Nenhum PDF importado ainda.</div>';
+
+  var detail = aiDocumentDetail;
+  var detailHtml = '<div class="ai-result-empty">Selecione um documento para ver a analise e aplicar as tarefas sugeridas.</div>';
+  if (detail) {
+    detailHtml =
+      '<div class="ai-result-stack">' +
+        '<div class="ai-mini-card">' +
+          '<div class="ai-mini-title">' + esc(detail.filename) + '<span>' + esc(detail.storageStatus || 'sem storage') + '</span></div>' +
+          '<div class="ai-mini-meta">Criado em ' + esc(fmtDateTime(detail.createdAt)) + '</div>' +
+          '<div class="ai-mini-copy">' + esc(detail.extractedPreview || '') + '</div>' +
+          '<div class="ai-inline-actions">' +
+            '<button class="btn btn-primary btn-sm" onclick="analyzeActivePendingDocument()">' + (aiDocumentAnalyzing ? 'Analisando...' : 'Analisar') + '</button>' +
+            '<button class="btn btn-amber btn-sm" onclick="applyActivePendingAssignments()">' + (aiDocumentApplying ? 'Aplicando...' : 'Aplicar designacoes') + '</button>' +
+          '</div>' +
+        '</div>' +
+        (detail.analysis ? '<div class="ai-mini-card"><div class="ai-mini-title">Resumo do documento</div><div class="ai-mini-copy">' + esc(detail.analysis.summary || '') + '</div>' + buildMiniList('Checklist', detail.analysis.checklist) + buildMiniList('Alertas', detail.analysis.alerts) + '</div>' : '') +
+        ((detail.suggestions || []).length ? '<div class="ai-result-grid">' + detail.suggestions.map(function (item) {
+          return '<div class="ai-mini-card">' +
+            '<div class="ai-mini-title">' + esc(item.title) + '<span>' + esc(item.assignedToName || '') + '</span></div>' +
+            '<div class="ai-mini-copy">' + esc(item.description || '') + '</div>' +
+            '<div class="ai-mini-meta">' + esc(item.reason || '') + '</div>' +
+          '</div>';
+        }).join('') + '</div>' : '') +
+      '</div>';
+  }
+
+  return '<div class="ai-doc-shell">' +
+    '<div>' + listHtml + '</div>' +
+    '<div>' + detailHtml + '</div>' +
+  '</div>';
+}
+
+function buildSpecialistsGrid(items) {
+  if (!items.length) return '';
+  return '<div class="ai-result-grid">' + items.slice(0, 4).map(function (item) {
+    return '<div class="ai-mini-card">' +
+      '<div class="ai-mini-title">' + esc(item.categoryLabel) + '</div>' +
+      (item.leaders || []).map(function (leader) {
+        return '<div class="ai-profile-row"><strong>' + esc(leader.name) + '</strong><span>score ' + esc(leader.score) + ' · conf. ' + esc(leader.confidence) + '</span></div>';
+      }).join('') +
+    '</div>';
+  }).join('') + '</div>';
+}
+
+function buildRedistributionGrid(items) {
+  if (!items.length) return '';
+  return '<div class="ai-result-grid">' + items.slice(0, 4).map(function (item) {
+    return '<div class="ai-mini-card">' +
+      '<div class="ai-mini-title">' + esc(item.title) + '<span>' + esc(item.currentAssignee || '') + '</span></div>' +
+      '<div class="ai-mini-meta">Sugestao: ' + esc(item.suggestedAssignee || '') + '</div>' +
+      '<div class="ai-mini-copy">' + esc(item.reason || '') + '</div>' +
+    '</div>';
+  }).join('') + '</div>';
+}
+
+function formatOperationalPeriod(value) {
+  return {
+    today: 'Hoje',
+    '7d': '7 dias',
+    '30d': '30 dias',
+    history: 'Historico'
+  }[value] || value || '';
 }
 
 async function buildDashboard() {
@@ -1323,6 +1818,7 @@ async function buildDashboard() {
 
 async function buildDashboardV2() {
   await loadManagerUsers();
+  await ensureOperationalAiData(false);
 
   var total = tasks.length;
   var doing = tasks.filter(function (task) { return task.status === 'doing'; }).length;
@@ -1349,6 +1845,7 @@ async function buildDashboardV2() {
   });
 
   var aiHtml = buildAiSectionV2();
+  var operationalHtml = buildOperationalIntelSection();
   var usersHtml = buildUsersSection();
   var historyHtml = await buildHistoryPanel();
   var dateStr = new Date().toLocaleDateString('pt-BR', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
@@ -1420,6 +1917,7 @@ async function buildDashboardV2() {
     '</div>' +
     '<div class="session-bar">Sessão autenticada pelo login principal. O painel do gestor abre direto, sem segunda senha artificial.</div>' +
     aiHtml +
+    operationalHtml +
     kpis +
     '<div class="section-title">Equipe e acessos</div>' +
     usersHtml +
@@ -1519,8 +2017,7 @@ async function closeDay() {
   try {
     await api('POST', '/history/close-day');
     await refreshWorkspace(true);
-    renderTeam();
-    renderMgr();
+    rerenderOperationalViews();
     showToast('Dia encerrado e salvo no historico!');
   } catch (error) {
     showToast(error.message);
@@ -1707,8 +2204,7 @@ function checkAutoClose() {
     api('POST', '/history/close-day').then(function () {
       return refreshWorkspace(true);
     }).then(function () {
-      renderTeam();
-      if (currentTab === 'mgr') renderMgr();
+      rerenderOperationalViews();
       showToast('Dia encerrado automaticamente (21h)');
     }).catch(function () {});
   }
@@ -1736,6 +2232,7 @@ document.addEventListener('keydown', function (event) {
 });
 
 setInterval(function () { if (currentTab === 'all') renderAll(); }, 15000);
+setInterval(function () { if (currentTab === 'tasks') renderTasksView(); }, 15000);
 setInterval(function () {
   if (currentTab === 'mgr' && !aiChatPending && !aiActionPending && !isManagerInteractionActive()) renderMgr();
 }, 10000);
