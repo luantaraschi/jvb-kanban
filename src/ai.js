@@ -2,7 +2,7 @@
 
 const { query } = require('./db');
 
-const GEMINI_API_URL = 'https://aiplatform.googleapis.com/v1/publishers/google/models';
+const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
 const DEFAULT_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 const AI_TIMEOUT_MS = Number(process.env.AI_TIMEOUT_MS || 45000);
 
@@ -400,7 +400,8 @@ async function requestStructuredJson(input) {
     const response = await fetch(buildGeminiUrl(), {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/json'
+        'Content-Type': 'application/json',
+        'x-goog-api-key': apiKey
       },
       body: JSON.stringify(buildGeminiPayload(input)),
       signal: controller.signal
@@ -437,7 +438,7 @@ async function requestStructuredJson(input) {
 }
 
 function buildGeminiUrl() {
-  return GEMINI_API_URL + '/' + encodeURIComponent(DEFAULT_MODEL) + ':generateContent?key=' + encodeURIComponent(process.env.GEMINI_API_KEY);
+  return GEMINI_API_URL + '/' + encodeURIComponent(DEFAULT_MODEL) + ':generateContent';
 }
 
 function buildGeminiPayload(input) {
