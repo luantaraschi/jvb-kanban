@@ -47,6 +47,46 @@ var aiDocumentUploading = false;
 var aiDocumentAnalyzing = false;
 var aiDocumentApplying = false;
 var aiOperationalLoadedAt = 0;
+var aiChatComposerExpanded = false;
+var aiChatPlaceholderIndex = 0;
+var aiChatMessageSeq = 0;
+
+var AI_CHAT_PLACEHOLDERS = [
+  'Ex: quem esta sobrecarregado hoje e o que devo redistribuir?',
+  'Ex: crie uma tarefa de protocolo para Ana Clara com prazo de hoje.',
+  'Ex: quais tarefas do Luan estao em andamento e ha quanto tempo?',
+  'Ex: analise o PDF enviado e proponha as tarefas iniciais.',
+  'Ex: qual colaborador performa melhor em tarefas administrativas?'
+];
+
+var AI_CHAT_COMMAND_SUGGESTIONS = [
+  { label: 'Sobrecarga', command: 'Quem esta sobrecarregado hoje e o que devo redistribuir?' },
+  { label: 'Redistribuir', command: 'Redistribua a tarefa "terminar distribuicao assistida" para o melhor responsavel disponivel.' },
+  { label: 'Criar tarefa', command: 'Crie uma tarefa de acompanhamento processual para Ana Beatriz.' },
+  { label: 'Status da equipe', command: 'Resuma as tarefas em andamento de toda a equipe.' },
+  { label: 'Analisar PDF', command: 'Analise o PDF mais recente e sugira a distribuicao das tarefas.' }
+];
+
+function nextAiMessageId() {
+  aiChatMessageSeq += 1;
+  return 'ai-msg-' + aiChatMessageSeq;
+}
+
+function pushAiChatMessage(role, content, options) {
+  var item = {
+    id: nextAiMessageId(),
+    role: role === 'assistant' ? 'assistant' : 'user',
+    content: String(content || '')
+  };
+  if (options && options.meta) item.meta = options.meta;
+  if (item.role === 'assistant') item.revealed = !!(options && options.revealed);
+  aiChatMessages.push(item);
+  return item;
+}
+
+function getAiChatPlaceholder() {
+  return AI_CHAT_PLACEHOLDERS[aiChatPlaceholderIndex % AI_CHAT_PLACEHOLDERS.length];
+}
 
 function apiHeaders() {
   var headers = { 'Content-Type': 'application/json' };
@@ -244,6 +284,10 @@ function esc(value) {
     .replace(/"/g, '&quot;');
 }
 
+function escAttr(value) {
+  return esc(value).replace(/'/g, '&#39;');
+}
+
 function pad(value) {
   return String(value).padStart(2, '0');
 }
@@ -265,6 +309,101 @@ function fmtDateTime(value) {
     hour: '2-digit',
     minute: '2-digit'
   });
+}
+
+function cycleAiChatPlaceholder() {
+  aiChatPlaceholderIndex = (aiChatPlaceholderIndex + 1) % AI_CHAT_PLACEHOLDERS.length;
+  if (currentTab === 'mgr' && !aiChatDraft && !isManagerInteractionActive()) renderMgr();
+}
+
+function toggleAiChatComposer(forceExpanded) {
+  var nextValue;
+  if (typeof forceExpanded === 'boolean') {
+    nextValue = forceExpanded;
+  } else {
+    nextValue = !aiChatComposerExpanded;
+  }
+  if (aiChatComposerExpanded === nextValue) return;
+  aiChatComposerExpanded = nextValue;
+  if (currentTab === 'mgr') renderMgr();
+}
+
+function useAiCommandSuggestion(command) {
+  aiChatDraft = command || '';
+  aiChatComposerExpanded = true;
+  renderMgr();
+  setTimeout(function () {
+    var input = document.getElementById('aiChatInput');
+    if (input) {
+      input.focus();
+      if (typeof input.setSelectionRange === 'function') {
+        input.setSelectionRange(input.value.length, input.value.length);
+      }
+    }
+  }, 0);
+}
+
+function triggerAiChatPdfPicker() {
+  var input = document.getElementById('aiChatPdfInput') || document.getElementById('aiPdfInput');
+  if (input) input.click();
+}
+
+function autoResizeAiChatInput() {
+  var input = document.getElementById('aiChatInput');
+  if (!input) return;
+  input.style.height = '0px';
+  input.style.height = Math.min(Math.max(input.scrollHeight, 52), 180) + 'px';
+}
+
+function hydrateManagerPanel() {
+  autoResizeAiChatInput();
+  animatePendingAiMessages();
+  var list = document.querySelector('.ai-messages');
+  if (list) list.scrollTop = list.scrollHeight;
+}
+
+function animatePendingAiMessages() {
+  var pending = document.querySelectorAll('.ai-stream[data-stream-state="pending"]');
+  pending.forEach(function (node) {
+    var messageId = node.getAttribute('data-message-id');
+    var content = node.getAttribute('data-stream-text') || '';
+    if (!messageId || !content) {
+      node.textContent = content;
+      node.setAttribute('data-stream-state', 'done');
+      return;
+    }
+    streamTextIntoNode(node, content, function () {
+      var match = aiChatMessages.filter(function (item) { return item.id === messageId; })[0];
+      if (match) match.revealed = true;
+      node.setAttribute('data-stream-state', 'done');
+    });
+  });
+}
+
+function streamTextIntoNode(node, content, onDone) {
+  if (!node) return;
+  var text = String(content || '');
+  if (!text || text.length > 900) {
+    node.textContent = text;
+    if (onDone) onDone();
+    return;
+  }
+
+  node.textContent = '';
+  var index = 0;
+  var chunk = text.length > 320 ? 6 : 3;
+
+  function tick() {
+    index = Math.min(index + chunk, text.length);
+    node.textContent = text.slice(0, index);
+    if (index < text.length) {
+      window.requestAnimationFrame(tick);
+      return;
+    }
+    if (onDone) onDone();
+  }
+
+  window.requestAnimationFrame(tick);
 }
 
 function findTask(id) {
@@ -949,6 +1088,7 @@ function renderMgr() {
   }
   buildDashboardV2().then(function (html) {
     panel.innerHTML = html;
+    hydrateManagerPanel();
   }).catch(function (error) {
     panel.innerHTML = '<div style="padding:40px;text-align:center;color:var(--red)">Erro ao carregar painel: ' + esc(error.message) + '</div>';
   });
@@ -1083,50 +1223,68 @@ function buildAiSectionV2() {
   var chatHtml = aiChatMessages.length
     ? aiChatMessages.map(function (item) {
       var role = item.role === 'assistant' ? 'assistant' : 'user';
+      var meta = item.meta ? '<div class="ai-bubble-meta">' + esc(item.meta) + '</div>' : '';
+      var body = item.role === 'assistant' && item.id && !item.revealed
+        ? '<div class="ai-bubble-copy ai-stream" data-message-id="' + escAttr(item.id) + '" data-stream-state="pending" data-stream-text="' + escAttr(item.content) + '"></div>'
+        : '<div class="ai-bubble-copy">' + esc(item.content) + '</div>';
       return '<div class="ai-bubble-row ' + role + '">' +
-        '<div class="ai-bubble ' + role + '">' + esc(item.content) + '</div>' +
+        '<div class="ai-bubble ' + role + '">' + meta + body + '</div>' +
         '</div>';
     }).join('')
     : '<div class="ai-empty-state">' +
-      '<div class="ai-empty-kicker">Modo consultivo + operacional</div>' +
-      '<div class="ai-empty-title">O assistente lê a operação e prepara ações reais em tarefas.</div>' +
-      '<div class="ai-empty-copy">Peça análise de produtividade, redistribuição, criação, edição, movimentação ou remoção de tarefas. Toda mutação exige sua confirmação explícita.</div>' +
+      '<div class="ai-empty-kicker">Assistente operacional do escritorio</div>' +
+      '<div class="ai-empty-title">Peça redistribuição, leitura de carga, criação de tarefas e apoio na análise de PDFs.</div>' +
+      '<div class="ai-empty-copy">O assistente prepara ações reais, mas nenhuma mudança é executada sem sua confirmação. Use os atalhos abaixo para começar mais rápido.</div>' +
       '</div>';
 
   var feedbackHtml = buildAiFeedbackPanel();
   var assignmentHtml = buildAiAssignmentPanel();
   var triageHtml = buildAiTriagePanel();
+  var commandsHtml = AI_CHAT_COMMAND_SUGGESTIONS.map(function (item) {
+    return '<button class="ai-command-chip" onclick="useAiCommandSuggestion(\'' + escAttr(item.command) + '\')"><span>' + esc(item.label) + '</span></button>';
+  }).join('');
+  var placeholder = getAiChatPlaceholder();
 
   return '<section class="ai-shell">' +
     '<div class="ai-chat-card">' +
       '<div class="ai-card-head">' +
         '<div>' +
           '<div class="ai-kicker">Assistente IA do Gestor</div>' +
-          '<h2 class="ai-title">Análise operacional com execução confirmável.</h2>' +
-          '<p class="ai-copy">O assistente pode preparar criação, edição, redistribuição, mudança de status e exclusão de tarefas. Nada roda sem sua autorização.</p>' +
+          '<h2 class="ai-title">Operação assistida com leitura clara, comandos úteis e execução confirmável.</h2>' +
+          '<p class="ai-copy">Use o chat para entender a carga da equipe, propor redistribuição, criar tarefas, ajustar status e puxar a análise de PDFs pendentes sem sair da primeira dobra do painel.</p>' +
         '</div>' +
         '<div class="ai-head-status">' +
           '<span class="ai-status-pill ' + (aiChatPending || aiActionPending ? 'busy' : 'ready') + '">' + (aiChatPending ? 'Respondendo' : aiActionPending ? 'Executando' : 'Pronto') + '</span>' +
-          '<span class="ai-status-note">Fluxo assistido, com confirmação manual</span>' +
+          '<span class="ai-status-note">Toda alteração em tarefa continua exigindo confirmação manual</span>' +
         '</div>' +
       '</div>' +
       '<div class="ai-messages">' + chatHtml + '</div>' +
       (aiPendingAction ? buildAiPendingActionCard() : '') +
-      '<div class="ai-composer">' +
-        '<textarea id="aiChatInput" class="ai-textarea" oninput="aiChatDraft=this.value" placeholder="Ex: redistribua a tarefa de protocolo do Luan para Ana Clara e coloque em andamento.">' + esc(aiChatDraft) + '</textarea>' +
-        '<div class="ai-composer-footer">' +
-          '<div class="ai-helper-text">Pedidos operacionais sempre voltam com resumo da ação e botões de confirmar ou cancelar.</div>' +
-          '<button class="btn btn-primary btn-sm" onclick="runAiChat()">' + (aiChatPending ? 'Aguarde...' : 'Enviar') + '</button>' +
+      '<div class="ai-command-row">' + commandsHtml + '</div>' +
+      '<div class="ai-composer-shell' + ((aiChatComposerExpanded || aiChatDraft) ? ' expanded' : '') + '" onclick="toggleAiChatComposer(true)">' +
+        '<input id="aiChatPdfInput" type="file" accept="application/pdf" style="display:none" onchange="handleAiPdfSelected(event)" />' +
+        '<div class="ai-composer-top">' +
+          '<button class="ai-composer-icon" type="button" onclick="event.stopPropagation();triggerAiChatPdfPicker()" title="Anexar PDF"><span>PDF</span></button>' +
+          '<div class="ai-composer-field">' +
+            '<textarea id="aiChatInput" class="ai-chat-input" onfocus="toggleAiChatComposer(true)" oninput="aiChatDraft=this.value;autoResizeAiChatInput()" onkeydown="handleAiChatKeydown(event)" placeholder="">' + esc(aiChatDraft) + '</textarea>' +
+            (!aiChatDraft ? '<div class="ai-chat-placeholder">' + esc(placeholder) + '</div>' : '') +
+          '</div>' +
+          '<button class="ai-composer-icon disabled" type="button" disabled title="Microfone indisponivel nesta versao"><span>Voz</span></button>' +
+          '<button class="ai-send-btn" type="button" onclick="event.stopPropagation();runAiChat()">' + (aiChatPending ? 'Aguarde...' : 'Enviar') + '</button>' +
+        '</div>' +
+        '<div class="ai-composer-footer modern">' +
+          '<div class="ai-helper-text">Descreva a ação ou use um comando sugerido. Você também pode anexar um PDF para alimentar a triagem e a distribuição assistida.</div>' +
+          '<div class="ai-composer-tools"><span class="ai-inline-pill">Carga da equipe</span><span class="ai-inline-pill">Redistribuição</span><span class="ai-inline-pill">PDF de pendencias</span></div>' +
         '</div>' +
       '</div>' +
     '</div>' +
     '<div class="ai-tool-grid">' +
       '<div class="ai-tool-card">' +
-        '<div class="ai-tool-head"><strong>Feedback de performance</strong><div class="ai-inline-actions"><select id="aiFeedbackPeriod" onchange="aiFeedbackPeriod=this.value" class="ai-select"><option value="today"' + (aiFeedbackPeriod === 'today' ? ' selected' : '') + '>Hoje</option><option value="7d"' + (aiFeedbackPeriod === '7d' ? ' selected' : '') + '>7 dias</option><option value="30d"' + (aiFeedbackPeriod === '30d' ? ' selected' : '') + '>30 dias</option><option value="history"' + (aiFeedbackPeriod === 'history' ? ' selected' : '') + '>Histórico</option></select><button class="btn btn-primary btn-sm" onclick="runAiFeedback()">Gerar</button></div></div>' +
+        '<div class="ai-tool-head"><div><strong>Feedback de performance</strong><div class="ai-tool-subhead">Leitura assistida da produção por período, com foco em risco, próximo passo e gargalo.</div></div><div class="ai-inline-actions"><select id="aiFeedbackPeriod" onchange="aiFeedbackPeriod=this.value" class="ai-select"><option value="today"' + (aiFeedbackPeriod === 'today' ? ' selected' : '') + '>Hoje</option><option value="7d"' + (aiFeedbackPeriod === '7d' ? ' selected' : '') + '>7 dias</option><option value="30d"' + (aiFeedbackPeriod === '30d' ? ' selected' : '') + '>30 dias</option><option value="history"' + (aiFeedbackPeriod === 'history' ? ' selected' : '') + '>Histórico</option></select><button class="btn btn-primary btn-sm" onclick="runAiFeedback()">Gerar</button></div></div>' +
         '<div class="ai-tool-body">' + feedbackHtml + '</div>' +
       '</div>' +
       '<div class="ai-tool-card">' +
-        '<div class="ai-tool-head"><strong>Distribuição assistida</strong><button class="btn btn-primary btn-sm" onclick="runAiAssignment()">Sugerir</button></div>' +
+        '<div class="ai-tool-head"><div><strong>Distribuição assistida</strong><div class="ai-tool-subhead">Use o rascunho da tarefa para ranquear os melhores responsáveis com justificativa objetiva.</div></div><button class="btn btn-primary btn-sm" onclick="runAiAssignment()">Sugerir</button></div>' +
         '<div class="ai-form-grid">' +
           '<input id="aiAssignTitle" class="ai-input" value="' + esc(aiAssignmentDraft.title) + '" oninput="aiAssignmentDraft.title=this.value" placeholder="Título da tarefa" />' +
           '<textarea id="aiAssignDesc" class="ai-textarea compact" oninput="aiAssignmentDraft.description=this.value" placeholder="Descrição / contexto da tarefa">' + esc(aiAssignmentDraft.description) + '</textarea>' +
@@ -1135,7 +1293,7 @@ function buildAiSectionV2() {
         '<div class="ai-tool-body">' + assignmentHtml + '</div>' +
       '</div>' +
       '<div class="ai-tool-card">' +
-        '<div class="ai-tool-head"><strong>Triagem de iniciais</strong><button class="btn btn-primary btn-sm" onclick="runAiInitialTriage()">Analisar</button></div>' +
+        '<div class="ai-tool-head"><div><strong>Triagem de iniciais</strong><div class="ai-tool-subhead">Transforme texto bruto em checklist, prioridade e tarefas iniciais sugeridas para o time.</div></div><button class="btn btn-primary btn-sm" onclick="runAiInitialTriage()">Analisar</button></div>' +
         '<div class="ai-form-grid">' +
           '<input id="aiInitialTitle" class="ai-input" value="' + esc(aiInitialDraft.title) + '" oninput="aiInitialDraft.title=this.value" placeholder="Título / assunto do caso" />' +
           '<textarea id="aiInitialText" class="ai-textarea tall" oninput="aiInitialDraft.initialText=this.value" placeholder="Cole aqui o texto da inicial">' + esc(aiInitialDraft.initialText) + '</textarea>' +
@@ -1240,7 +1398,7 @@ function formatTaskStatusLabel(value) {
 function buildMiniList(title, items) {
   var list = Array.isArray(items) ? items.filter(Boolean) : [];
   if (!list.length) return '';
-  return '<div><strong>' + esc(title) + ':</strong><ul style="margin:6px 0 0 18px;padding:0;display:grid;gap:4px;font-size:12px">' + list.map(function (item) {
+  return '<div class="ai-list-block"><strong>' + esc(title) + ':</strong><ul class="ai-bullet-list">' + list.map(function (item) {
     return '<li>' + esc(item) + '</li>';
   }).join('') + '</ul></div>';
 }
@@ -1289,13 +1447,22 @@ async function runAiInitialTriage() {
   }
 }
 
+function handleAiChatKeydown(event) {
+  if (!event) return;
+  if (event.key === 'Enter' && !event.shiftKey) {
+    event.preventDefault();
+    runAiChat();
+  }
+}
+
 async function runAiChat() {
   var message = (document.getElementById('aiChatInput') ? document.getElementById('aiChatInput').value : aiChatDraft).trim();
   if (!message || aiChatPending) return;
-  aiChatMessages.push({ role: 'user', content: message });
+  pushAiChatMessage('user', message);
   aiChatDraft = '';
   aiPendingAction = null;
   aiChatPending = true;
+  aiChatComposerExpanded = true;
   renderMgr();
   try {
     var reply = await api('POST', '/manager/ai/chat', {
@@ -1311,12 +1478,21 @@ async function runAiChat() {
         actionPreview: reply.actionPreview || null
       }
       : null;
-    aiChatMessages.push({ role: 'assistant', content: reply.reply || 'Sem resposta da IA.' });
+    pushAiChatMessage('assistant', reply.reply || 'Sem resposta da IA.', {
+      revealed: false,
+      meta: reply.mode === 'action' ? 'acao preparada' : 'analise operacional'
+    });
     if (reply.suggestions && reply.suggestions.length) {
-      aiChatMessages.push({ role: 'assistant', content: 'Sugestões:\n- ' + reply.suggestions.join('\n- ') });
+      pushAiChatMessage('assistant', 'Sugestões:\n- ' + reply.suggestions.join('\n- '), {
+        revealed: false,
+        meta: 'sugestões'
+      });
     }
     if (reply.alerts && reply.alerts.length) {
-      aiChatMessages.push({ role: 'assistant', content: 'Alertas:\n- ' + reply.alerts.join('\n- ') });
+      pushAiChatMessage('assistant', 'Alertas:\n- ' + reply.alerts.join('\n- '), {
+        revealed: false,
+        meta: 'alertas'
+      });
     }
   } catch (error) {
     showToast(error.message);
@@ -1336,7 +1512,10 @@ async function confirmAiPendingAction() {
       taskId: aiPendingAction.taskId,
       payload: aiPendingAction.payload
     });
-    aiChatMessages.push({ role: 'assistant', content: result.message || 'Ação executada com sucesso.' });
+    pushAiChatMessage('assistant', result.message || 'Ação executada com sucesso.', {
+      revealed: false,
+      meta: 'ação confirmada'
+    });
     aiPendingAction = null;
     await refreshWorkspace(true);
     rerenderOperationalViews();
@@ -1351,7 +1530,10 @@ async function confirmAiPendingAction() {
 
 function cancelAiPendingAction() {
   if (!aiPendingAction) return;
-  aiChatMessages.push({ role: 'assistant', content: 'Ação cancelada. Nenhuma tarefa foi alterada.' });
+  pushAiChatMessage('assistant', 'Ação cancelada. Nenhuma tarefa foi alterada.', {
+    revealed: false,
+    meta: 'ação cancelada'
+  });
   aiPendingAction = null;
   renderMgr();
 }
@@ -1502,11 +1684,16 @@ async function handleAiPdfSelected(event) {
     aiDocuments = await api('GET', '/manager/ai/pending-documents');
     aiDocumentDetail = await api('GET', '/manager/ai/pending-documents/' + document.id);
     aiOperationalLoadedAt = Date.now();
+    pushAiChatMessage('assistant', 'PDF "' + file.name + '" importado com sucesso. Ele ja esta disponivel no painel de documentos e pode ser analisado agora.', {
+      revealed: false,
+      meta: 'pdf importado'
+    });
     showToast('PDF enviado e registrado');
   } catch (error) {
     showToast(error.message);
   } finally {
     aiDocumentUploading = false;
+    if (event && event.target) event.target.value = '';
     renderMgr();
   }
 }
@@ -1562,24 +1749,33 @@ function buildOperationalIntelSection() {
     ? '<div class="ai-result-empty">Atualizando snapshot operacional...</div>'
     : snapshot
       ? '<div class="ai-op-summary">' +
-        '<div class="ai-op-lead">' + esc(snapshot.executiveSummary || '') + '</div>' +
-        '<div class="ai-op-meta">' +
-          '<span><strong>Periodo:</strong> ' + esc(formatOperationalPeriod(snapshot.period)) + '</span>' +
-          '<span><strong>Atualizado:</strong> ' + esc(fmtDateTime(snapshot.generatedAt)) + '</span>' +
-          '<span><strong>Origem:</strong> ' + esc(snapshot.source || 'manual') + '</span>' +
+        '<div class="ai-op-hero">' +
+          '<div>' +
+            '<div class="ai-kicker">Inteligencia operacional</div>' +
+            '<div class="ai-op-lead">' + esc(snapshot.executiveSummary || '') + '</div>' +
+          '</div>' +
+          '<div class="ai-op-meta">' +
+            '<span><strong>Periodo:</strong> ' + esc(formatOperationalPeriod(snapshot.period)) + '</span>' +
+            '<span><strong>Atualizado:</strong> ' + esc(fmtDateTime(snapshot.generatedAt)) + '</span>' +
+            '<span><strong>Origem:</strong> ' + esc(snapshot.source || 'manual') + '</span>' +
+          '</div>' +
         '</div>' +
-        buildMiniList('Alertas ativos', snapshot.alerts) +
-        buildMiniList('Recomendacoes', snapshot.recommendations) +
-        buildMiniList('Notas de carga', snapshot.loadNotes) +
-        buildSpecialistsGrid(snapshot.topSpecialists || []) +
-        buildRedistributionGrid(snapshot.redistributionCandidates || []) +
+        '<div class="ai-op-insights">' +
+          buildOperationalInsightCard('Alertas ativos', snapshot.alerts, 'Nenhum alerta forte no periodo atual.') +
+          buildOperationalInsightCard('Recomendacoes', snapshot.recommendations, 'Nenhuma recomendacao adicional no snapshot atual.') +
+          buildOperationalInsightCard('Notas de carga', snapshot.loadNotes, 'Sem observacoes extras de carga no momento.') +
+        '</div>' +
+        '<div class="ai-op-split">' +
+          '<div class="ai-op-pane"><div class="ai-op-pane-head">Especialistas por categoria</div>' + buildSpecialistsGrid(snapshot.topSpecialists || []) + '</div>' +
+          '<div class="ai-op-pane"><div class="ai-op-pane-head">Redistribuicoes sugeridas</div>' + buildRedistributionGrid(snapshot.redistributionCandidates || []) + '</div>' +
+        '</div>' +
         '</div>'
       : '<div class="ai-result-empty">Nenhum snapshot operacional persistido ainda.</div>';
 
   return '<section class="ai-op-shell">' +
     '<div class="ai-op-card">' +
       '<div class="ai-tool-head">' +
-        '<strong>Inteligencia operacional</strong>' +
+        '<div><strong>Inteligencia operacional</strong><div class="ai-tool-subhead">Snapshot executivo da operacao para consulta rapida e redistribuicao orientada por dados.</div></div>' +
         '<div class="ai-inline-actions">' +
           '<select class="ai-select" onchange="changeOperationalPeriod(this.value)">' +
             '<option value="today"' + (aiOperationalPeriod === 'today' ? ' selected' : '') + '>Hoje</option>' +
@@ -1615,9 +1811,9 @@ function buildProfilesPanel() {
     return '<div class="ai-result-empty">Perfis ainda nao calculados. Gere um snapshot para popular essa camada.</div>';
   }
 
-  return '<div class="ai-result-grid">' + aiProfilesState.employees.map(function (employee) {
+  return '<div class="ai-profile-grid">' + aiProfilesState.employees.map(function (employee) {
     var topProfiles = (employee.profiles || []).slice(0, 3);
-    return '<div class="ai-mini-card">' +
+    return '<div class="ai-profile-card">' +
       '<div class="ai-mini-title">' + esc(employee.name) + '<span>' + topProfiles.length + ' destaque(s)</span></div>' +
       topProfiles.map(function (profile) {
         return '<div class="ai-profile-row">' +
@@ -1648,7 +1844,7 @@ function buildPendingDocumentsPanel() {
   if (detail) {
     detailHtml =
       '<div class="ai-result-stack">' +
-        '<div class="ai-mini-card">' +
+        '<div class="ai-doc-detail-card">' +
           '<div class="ai-mini-title">' + esc(detail.filename) + '<span>' + esc(detail.storageStatus || 'sem storage') + '</span></div>' +
           '<div class="ai-mini-meta">Criado em ' + esc(fmtDateTime(detail.createdAt)) + '</div>' +
           '<div class="ai-mini-copy">' + esc(detail.extractedPreview || '') + '</div>' +
@@ -1657,9 +1853,9 @@ function buildPendingDocumentsPanel() {
             '<button class="btn btn-amber btn-sm" onclick="applyActivePendingAssignments()">' + (aiDocumentApplying ? 'Aplicando...' : 'Aplicar designacoes') + '</button>' +
           '</div>' +
         '</div>' +
-        (detail.analysis ? '<div class="ai-mini-card"><div class="ai-mini-title">Resumo do documento</div><div class="ai-mini-copy">' + esc(detail.analysis.summary || '') + '</div>' + buildMiniList('Checklist', detail.analysis.checklist) + buildMiniList('Alertas', detail.analysis.alerts) + '</div>' : '') +
+        (detail.analysis ? '<div class="ai-doc-detail-card"><div class="ai-mini-title">Resumo do documento</div><div class="ai-mini-copy">' + esc(detail.analysis.summary || '') + '</div>' + buildMiniList('Checklist', detail.analysis.checklist) + buildMiniList('Alertas', detail.analysis.alerts) + '</div>' : '') +
         ((detail.suggestions || []).length ? '<div class="ai-result-grid">' + detail.suggestions.map(function (item) {
-          return '<div class="ai-mini-card">' +
+          return '<div class="ai-doc-suggestion-card">' +
             '<div class="ai-mini-title">' + esc(item.title) + '<span>' + esc(item.assignedToName || '') + '</span></div>' +
             '<div class="ai-mini-copy">' + esc(item.description || '') + '</div>' +
             '<div class="ai-mini-meta">' + esc(item.reason || '') + '</div>' +
@@ -1674,8 +1870,20 @@ function buildPendingDocumentsPanel() {
   '</div>';
 }
 
+function buildOperationalInsightCard(title, items, emptyText) {
+  var list = Array.isArray(items) ? items.filter(Boolean) : [];
+  return '<div class="ai-op-insight-card">' +
+    '<div class="ai-op-pane-head">' + esc(title) + '</div>' +
+    (list.length
+      ? '<div class="ai-op-bullet-list">' + list.map(function (item) {
+        return '<div class="ai-op-bullet-item">' + esc(item) + '</div>';
+      }).join('') + '</div>'
+      : '<div class="ai-result-empty">' + esc(emptyText) + '</div>') +
+    '</div>';
+}
+
 function buildSpecialistsGrid(items) {
-  if (!items.length) return '';
+  if (!items.length) return '<div class="ai-result-empty">Ainda nao ha especialistas ranqueados neste periodo.</div>';
   return '<div class="ai-result-grid">' + items.slice(0, 4).map(function (item) {
     return '<div class="ai-mini-card">' +
       '<div class="ai-mini-title">' + esc(item.categoryLabel) + '</div>' +
@@ -1687,7 +1895,7 @@ function buildSpecialistsGrid(items) {
 }
 
 function buildRedistributionGrid(items) {
-  if (!items.length) return '';
+  if (!items.length) return '<div class="ai-result-empty">Nenhuma redistribuicao sugerida no snapshot atual.</div>';
   return '<div class="ai-result-grid">' + items.slice(0, 4).map(function (item) {
     return '<div class="ai-mini-card">' +
       '<div class="ai-mini-title">' + esc(item.title) + '<span>' + esc(item.currentAssignee || '') + '</span></div>' +
@@ -2236,4 +2444,5 @@ setInterval(function () { if (currentTab === 'tasks') renderTasksView(); }, 1500
 setInterval(function () {
   if (currentTab === 'mgr' && !aiChatPending && !aiActionPending && !isManagerInteractionActive()) renderMgr();
 }, 10000);
+setInterval(cycleAiChatPlaceholder, 3200);
 setInterval(updateDate, 60000);

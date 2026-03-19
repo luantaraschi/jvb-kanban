@@ -243,7 +243,7 @@ async function runManagerChat(input) {
     throw error;
   }
 
-  const context = await buildManagerContext({ period: '7d' });
+  const context = await buildManagerContext({ period: '30d' });
   const schema = {
     type: 'object',
     additionalProperties: false,
@@ -289,11 +289,14 @@ async function runManagerChat(input) {
       'Nao invente ids, tarefas ou usuarios. Use somente os ids do contexto. ' +
       'Use um destes tipos de acao: none, create_task, update_task, change_status, reassign_task, delete_task. ' +
       'Para localizar uma tarefa existente, prefira taskId. So use pendingAction quando estiver seguro. Se faltar informacao, faca uma pergunta em reply e deixe pendingAction.type="none". ' +
+      'Priorize objetividade, leitura operacional ampla do contexto e justificativas claras para distribuicao ou redistribuicao. ' +
       'Contexto da equipe: ' + JSON.stringify({
         teamContext: context.meta,
         employees: context.teamMembers,
         employeeMetrics: context.employeeMetrics.map(toChatMetric),
-        currentTasks: context.currentTasks
+        currentTasks: context.currentTasks,
+        operationalSnapshot: context.latestSnapshot || null,
+        pendingDocuments: context.pendingDocuments || []
       }),
     messages
   });
@@ -375,6 +378,26 @@ async function buildManagerContext(input) {
     closedAt: row.closed_at,
     data: typeof row.data === 'string' ? JSON.parse(row.data) : row.data
   }));
+
+  const latestSnapshotResult = await query(
+    `
+      SELECT period, source, generated_at, executive_summary, alerts, recommendations, load_notes
+      FROM ai_operational_snapshots
+      WHERE period = $1
+      ORDER BY generated_at DESC
+      LIMIT 1
+    `,
+    [period]
+  );
+
+  const pendingDocumentsResult = await query(
+    `
+      SELECT id, filename, status, created_at, analysis_json
+      FROM ai_pending_documents
+      ORDER BY created_at DESC
+      LIMIT 5
+    `
+  );
 
   const employeeMetrics = employees.rows.map((emp) => {
     const empId = Number(emp.id);
@@ -468,7 +491,28 @@ async function buildManagerContext(input) {
         });
       });
       return all;
-    }, [])
+    }, []),
+    latestSnapshot: latestSnapshotResult.rows[0]
+      ? {
+        period: latestSnapshotResult.rows[0].period,
+        source: latestSnapshotResult.rows[0].source,
+        generatedAt: latestSnapshotResult.rows[0].generated_at,
+        executiveSummary: latestSnapshotResult.rows[0].executive_summary,
+        alerts: ensureStringArray(latestSnapshotResult.rows[0].alerts),
+        recommendations: ensureStringArray(latestSnapshotResult.rows[0].recommendations),
+        loadNotes: ensureStringArray(latestSnapshotResult.rows[0].load_notes)
+      }
+      : null,
+    pendingDocuments: pendingDocumentsResult.rows.map((row) => {
+      const analysis = typeof row.analysis_json === 'string' ? JSON.parse(row.analysis_json) : row.analysis_json;
+      return {
+        id: String(row.id),
+        filename: row.filename,
+        status: row.status,
+        createdAt: row.created_at,
+        summary: analysis && analysis.summary ? analysis.summary : ''
+      };
+    })
   };
 }
 
