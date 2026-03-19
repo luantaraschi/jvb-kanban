@@ -927,7 +927,7 @@ function buildAiSection() {
 
   return '<div style="display:grid;gap:18px;margin-bottom:24px">' +
     '<div style="border:1px solid var(--border);border-radius:16px;padding:16px;background:linear-gradient(135deg,#f9fbff 0%,#f4f8ff 100%)">' +
-    '<div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start;margin-bottom:12px"><div><div style="font-size:18px;font-weight:700">Assistente IA do Gestor</div><div style="font-size:12px;color:var(--text-light)">Feedback de produção, sugestão de responsáveis e triagem assistida de iniciais. Tudo com confirmação manual.</div></div><div style="font-size:11px;color:var(--text-light)">Exige OPENAI_API_KEY no backend</div></div>' +
+    '<div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start;margin-bottom:12px"><div><div style="font-size:18px;font-weight:700">Assistente IA do Gestor</div><div style="font-size:12px;color:var(--text-light)">Feedback de produção, sugestão de responsáveis e triagem assistida de iniciais. Tudo com confirmação manual.</div></div><div style="font-size:11px;color:var(--text-light)">Exige GEMINI_API_KEY no backend</div></div>' +
     '<div style="display:grid;grid-template-columns:1.2fr 1fr;gap:14px">' +
     '<div style="border:1px solid var(--border);border-radius:14px;background:#fff;padding:12px">' +
     '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px"><strong>Chat administrativo</strong>' + (aiChatPending ? '<span style="font-size:11px;color:var(--text-light)">Respondendo...</span>' : '') + '</div>' +

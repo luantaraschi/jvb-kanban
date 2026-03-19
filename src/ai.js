@@ -2,17 +2,17 @@
 
 const { query } = require('./db');
 
-const OPENAI_API_URL = 'https://api.openai.com/v1/chat/completions';
-const DEFAULT_MODEL = process.env.OPENAI_MODEL || 'gpt-5-mini';
+const GEMINI_API_URL = 'https://aiplatform.googleapis.com/v1/publishers/google/models';
+const DEFAULT_MODEL = process.env.GEMINI_MODEL || 'gemini-3-flash-preview';
 const AI_TIMEOUT_MS = Number(process.env.AI_TIMEOUT_MS || 45000);
 
 function isAiEnabled() {
-  return process.env.AI_ENABLED !== 'false' && !!process.env.OPENAI_API_KEY;
+  return process.env.AI_ENABLED !== 'false' && !!process.env.GEMINI_API_KEY;
 }
 
 function ensureAiEnabled() {
-  if (!process.env.OPENAI_API_KEY) {
-    const error = new Error('OPENAI_API_KEY nao configurada');
+  if (!process.env.GEMINI_API_KEY) {
+    const error = new Error('GEMINI_API_KEY nao configurada');
     error.status = 503;
     throw error;
   }
@@ -56,7 +56,6 @@ async function generateFeedback(input) {
   };
 
   const result = await requestStructuredJson({
-    schemaName: 'manager_feedback',
     schema,
     systemPrompt:
       'Voce e um analista operacional para escritorio de advocacia. ' +
@@ -124,7 +123,6 @@ async function suggestTaskAssignment(input) {
   let structured;
   try {
     structured = await requestStructuredJson({
-      schemaName: 'task_assignment',
       schema,
       systemPrompt:
         'Voce distribui tarefas em um escritorio de advocacia. ' +
@@ -191,14 +189,13 @@ async function triageInitial(input) {
   };
 
   const result = await requestStructuredJson({
-    schemaName: 'initial_triage',
     schema,
     systemPrompt:
       'Voce atua na triagem operacional de iniciais em um escritorio de advocacia. ' +
       'Produza uma resposta objetiva, prudente e operacional. ' +
       'Nao de consultoria juridica definitiva. Use apenas o contexto fornecido.',
     userPayload: {
-      goal: 'Triage operacional de uma inicial com sugestoes de tarefas e responsaveis.',
+      goal: 'Triagem operacional de uma inicial com sugestoes de tarefas e responsaveis.',
       initial: {
         title: title || 'Sem titulo',
         text: initialText,
@@ -229,32 +226,6 @@ async function runManagerChat(input) {
   }
 
   const context = await buildManagerContext({ period: '7d' });
-  const chatMessages = [];
-  chatMessages.push({
-    role: 'system',
-    content:
-      'Voce e um assistente operacional do painel do gestor em um escritorio de advocacia. ' +
-      'Responda em portugues, de forma objetiva, pratica e com base apenas nos dados fornecidos. ' +
-      'Nao faca promessas sobre automacoes nao executadas. ' +
-      'Quando sugerir acoes, deixe claro que o gestor ainda precisa confirmar.'
-  });
-  chatMessages.push({
-    role: 'system',
-    content: JSON.stringify({
-      teamContext: context.meta,
-      employeeMetrics: context.employeeMetrics
-    })
-  });
-
-  history.forEach((item) => {
-    if (!item || !item.role || !item.content) return;
-    chatMessages.push({
-      role: item.role === 'assistant' ? 'assistant' : 'user',
-      content: String(item.content)
-    });
-  });
-  chatMessages.push({ role: 'user', content: message });
-
   const schema = {
     type: 'object',
     additionalProperties: false,
@@ -266,10 +237,28 @@ async function runManagerChat(input) {
     required: ['reply', 'suggestions', 'alerts']
   };
 
+  const messages = [];
+  history.forEach((item) => {
+    if (!item || !item.role || !item.content) return;
+    messages.push({
+      role: item.role === 'assistant' ? 'assistant' : 'user',
+      content: String(item.content)
+    });
+  });
+  messages.push({ role: 'user', content: message });
+
   const result = await requestStructuredJson({
-    schemaName: 'manager_chat',
     schema,
-    messages: chatMessages
+    systemPrompt:
+      'Voce e um assistente operacional do painel do gestor em um escritorio de advocacia. ' +
+      'Responda em portugues, de forma objetiva, pratica e com base apenas nos dados fornecidos. ' +
+      'Nao faca promessas sobre automacoes nao executadas. ' +
+      'Quando sugerir acoes, deixe claro que o gestor ainda precisa confirmar. ' +
+      'Contexto da equipe: ' + JSON.stringify({
+        teamContext: context.meta,
+        employeeMetrics: context.employeeMetrics
+      }),
+    messages
   });
 
   return {
@@ -403,39 +392,17 @@ async function buildManagerContext(input) {
 }
 
 async function requestStructuredJson(input) {
-  const apiKey = process.env.OPENAI_API_KEY;
+  const apiKey = process.env.GEMINI_API_KEY;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), AI_TIMEOUT_MS);
 
   try {
-    const body = {
-      model: DEFAULT_MODEL,
-      response_format: {
-        type: 'json_schema',
-        json_schema: {
-          name: input.schemaName,
-          strict: true,
-          schema: input.schema
-        }
-      }
-    };
-
-    if (Array.isArray(input.messages) && input.messages.length) {
-      body.messages = input.messages;
-    } else {
-      body.messages = [
-        { role: 'system', content: input.systemPrompt || 'Responda apenas com JSON valido.' },
-        { role: 'user', content: JSON.stringify(input.userPayload || {}) }
-      ];
-    }
-
-    const response = await fetch(OPENAI_API_URL, {
+    const response = await fetch(buildGeminiUrl(), {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/json',
-        Authorization: 'Bearer ' + apiKey
+        'Content-Type': 'application/json'
       },
-      body: JSON.stringify(body),
+      body: JSON.stringify(buildGeminiPayload(input)),
       signal: controller.signal
     });
 
@@ -449,19 +416,14 @@ async function requestStructuredJson(input) {
       throw error;
     }
 
-    const content = payload
-      && payload.choices
-      && payload.choices[0]
-      && payload.choices[0].message
-      && payload.choices[0].message.content;
-
-    if (!content) {
+    const text = extractGeminiText(payload);
+    if (!text) {
       const error = new Error('Resposta da IA vazia');
       error.status = 502;
       throw error;
     }
 
-    return JSON.parse(content);
+    return JSON.parse(stripCodeFence(text));
   } catch (error) {
     if (error.name === 'AbortError') {
       const timeoutError = new Error('A IA demorou demais para responder');
@@ -472,6 +434,69 @@ async function requestStructuredJson(input) {
   } finally {
     clearTimeout(timeout);
   }
+}
+
+function buildGeminiUrl() {
+  return GEMINI_API_URL + '/' + encodeURIComponent(DEFAULT_MODEL) + ':generateContent?key=' + encodeURIComponent(process.env.GEMINI_API_KEY);
+}
+
+function buildGeminiPayload(input) {
+  const payload = {
+    generationConfig: {
+      temperature: 0.2,
+      responseMimeType: 'application/json',
+      responseJsonSchema: input.schema
+    }
+  };
+
+  const systemText = cleanText(input.systemPrompt || 'Responda apenas com JSON valido.');
+  if (systemText) {
+    payload.systemInstruction = {
+      role: 'system',
+      parts: [{ text: systemText }]
+    };
+  }
+
+  if (Array.isArray(input.messages) && input.messages.length) {
+    payload.contents = input.messages
+      .filter((message) => message && message.content && message.role !== 'system')
+      .map((message) => ({
+        role: message.role === 'assistant' ? 'model' : 'user',
+        parts: [{ text: String(message.content) }]
+      }));
+  } else {
+    payload.contents = [
+      {
+        role: 'user',
+        parts: [{ text: JSON.stringify(input.userPayload || {}) }]
+      }
+    ];
+  }
+
+  return payload;
+}
+
+function extractGeminiText(payload) {
+  const part = payload
+    && payload.candidates
+    && payload.candidates[0]
+    && payload.candidates[0].content
+    && payload.candidates[0].content.parts
+    && payload.candidates[0].content.parts[0];
+
+  if (part && typeof part.text === 'string') {
+    return part.text;
+  }
+  return '';
+}
+
+function stripCodeFence(value) {
+  const text = String(value || '').trim();
+  if (!text.startsWith('```')) return text;
+  return text
+    .replace(/^```[a-zA-Z0-9_-]*\s*/, '')
+    .replace(/\s*```$/, '')
+    .trim();
 }
 
 function sanitizeEmployeeFeedback(items, metrics) {
