@@ -18,6 +18,18 @@ var token = localStorage.getItem('jvb_token') || null;
 var modalEmpId = null;
 var editingUserId = null;
 var resetUserId = null;
+var aiFeedbackPeriod = '7d';
+var aiChatMessages = [];
+var aiChatPending = false;
+var aiFeedbackResult = null;
+var aiFeedbackLoading = false;
+var aiAssignmentResult = null;
+var aiAssignmentLoading = false;
+var aiInitialResult = null;
+var aiInitialLoading = false;
+var aiAssignmentDraft = { title: '', description: '', assignedBy: '' };
+var aiInitialDraft = { title: '', initialText: '', contextNote: '' };
+var aiChatDraft = '';
 
 function apiHeaders() {
   var headers = { 'Content-Type': 'application/json' };
@@ -131,8 +143,9 @@ async function refreshWorkspace(withManagerUsers) {
   }
 
   syncAssignedByOptions();
+  syncEmployeeOptions();
 
-  if (currentUser && currentUser.role === 'manager' && activeId && !findEmp(activeId)) {
+  if (activeId && !findEmp(activeId)) {
     activeId = employees[0] ? employees[0].id : null;
   }
 }
@@ -167,6 +180,11 @@ function syncAssignedByOptions() {
   fillSelectOptions('eAssignedVal', uniqueNames);
 }
 
+function syncEmployeeOptions() {
+  fillEmployeeSelect('iEmp', employees, modalEmpId || activeId || (currentUser ? currentUser.id : null));
+  fillEmployeeSelect('eEmpVal', employees, null);
+}
+
 function fillSelectOptions(id, names) {
   var select = document.getElementById(id);
   if (!select) return;
@@ -177,6 +195,19 @@ function fillSelectOptions(id, names) {
   });
   select.innerHTML = options.join('');
   if (currentValue) select.value = currentValue;
+}
+
+function fillEmployeeSelect(id, people, selectedId) {
+  var select = document.getElementById(id);
+  if (!select) return;
+  var currentValue = select.value;
+  var options = ['<option value="">Selecione...</option>'];
+  people.forEach(function (person) {
+    options.push('<option value="' + person.id + '">' + esc(person.name) + '</option>');
+  });
+  select.innerHTML = options.join('');
+  var nextValue = selectedId != null ? String(selectedId) : currentValue;
+  if (nextValue) select.value = nextValue;
 }
 
 function ini(name) {
@@ -204,6 +235,19 @@ function rep(ch, times) {
   var out = '';
   for (var i = 0; i < times; i += 1) out += ch;
   return out;
+}
+
+function fmtDateTime(value) {
+  if (!value) return '—';
+  var date = new Date(value);
+  if (isNaN(date.getTime())) return String(value);
+  return date.toLocaleString('pt-BR', {
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit'
+  });
 }
 
 function findTask(id) {
@@ -299,11 +343,6 @@ function switchTab(tab) {
 }
 
 function selectEmp(empId) {
-  if (currentUser && currentUser.role === 'employee' && empId !== currentUser.id) {
-    activeId = currentUser.id;
-    switchTab('all');
-    return;
-  }
   activeId = empId;
   renderTeam();
 }
@@ -312,10 +351,6 @@ function openAdd(col) {
   var empId = activeId;
   var emp = findEmp(empId);
   var empName = emp ? emp.name : '';
-  if (currentUser && currentUser.role === 'employee') {
-    empId = currentUser.id;
-    empName = currentUser.name;
-  }
   if (!empName) {
     showToast('Selecione um funcionario');
     return;
@@ -325,7 +360,8 @@ function openAdd(col) {
   document.getElementById('iTitle').value = '';
   document.getElementById('iDesc').value = '';
   document.getElementById('iAssignedBy').value = '';
-  document.getElementById('iEmp').value = empName;
+  syncEmployeeOptions();
+  document.getElementById('iEmp').value = String(empId);
   document.getElementById('iStatus').value = col || 'todo';
   document.getElementById('addModal').classList.add('open');
   setTimeout(function () {
@@ -338,10 +374,12 @@ async function addTask() {
   var desc = document.getElementById('iDesc').value.trim();
   var assignedBy = document.getElementById('iAssignedBy').value;
   var status = document.getElementById('iStatus').value;
+  var userId = Number(document.getElementById('iEmp').value);
 
   if (!title) return showToast('Digite o titulo');
   if (!desc) return showToast('Digite a descricao');
   if (!assignedBy) return showToast('Selecione quem designou');
+  if (!userId) return showToast('Selecione o responsavel');
 
   try {
     var task = await api('POST', '/tasks', {
@@ -349,12 +387,14 @@ async function addTask() {
       description: desc,
       assignedBy: assignedBy,
       status: status,
-      userId: modalEmpId
+      userId: userId
     });
     tasks.unshift(task);
     if (task.status === 'doing') startTimer(task.id);
+    activeId = task.empId;
     renderTeam();
     if (currentTab === 'all') renderAll();
+    if (currentTab === 'mgr' && mgrUnlocked) renderMgr();
     overlayClose('addModal');
     showToast('Tarefa criada');
   } catch (error) {
@@ -460,6 +500,12 @@ function openEdit(id) {
   document.getElementById('eDescVal').value = task.desc || '';
   document.getElementById('eNotesVal').value = task.notes || '';
   document.getElementById('eAssignedVal').value = task.assignedBy || '';
+  syncEmployeeOptions();
+  document.getElementById('eEmpVal').value = String(task.empId);
+  document.getElementById('eAuditInfo').textContent =
+    'Criada por ' + (task.createdByName || '—') +
+    ' · última edição ' + (task.updatedByName || '—') +
+    (task.lastEditedAt ? ' em ' + fmtDateTime(task.lastEditedAt) : '');
   document.getElementById('editModal').classList.add('open');
   setTimeout(function () {
     document.getElementById('eTitleVal').focus();
@@ -478,10 +524,12 @@ async function saveEdit() {
       title: title,
       description: document.getElementById('eDescVal').value.trim(),
       notes: document.getElementById('eNotesVal').value.trim(),
-      assignedBy: document.getElementById('eAssignedVal').value
+      assignedBy: document.getElementById('eAssignedVal').value,
+      userId: Number(document.getElementById('eEmpVal').value)
     });
     var index = tasks.findIndex(function (task) { return task.id === editingId; });
     if (index !== -1) tasks[index] = updated;
+    activeId = updated.empId;
     renderTeam();
     if (currentTab === 'all') renderAll();
     if (currentTab === 'mgr' && mgrUnlocked) renderMgr();
@@ -506,7 +554,6 @@ function renderSidebar() {
   employees.forEach(function (emp) {
     var empTasks = tasks.filter(function (task) { return task.empId === emp.id; });
     var doing = empTasks.filter(function (task) { return task.status === 'doing'; }).length;
-    var isOwnBoard = !currentUser || currentUser.role === 'manager' || emp.id === currentUser.id;
     var isActive = currentTab === 'team' && emp.id === activeId;
     var row = document.createElement('div');
     row.className = 'emp-row' + (isActive ? ' active' : '');
@@ -514,7 +561,6 @@ function renderSidebar() {
       row.style.background = emp.pastel;
       row.style.borderColor = 'rgba(0,0,0,.08)';
     }
-    if (!isOwnBoard) row.title = 'Use Ver Todos para acompanhar a equipe';
     row.onclick = function () { selectEmp(emp.id); };
     row.innerHTML =
       '<div class="emp-av" style="background:' + (emp.color || '#888') + '">' + ini(emp.name) + '</div>' +
@@ -543,11 +589,6 @@ function renderBoard() {
 
   var empId = activeId;
   var emp = findEmp(empId);
-
-  if (currentUser && currentUser.role === 'employee') {
-    emp = currentUser;
-    empId = currentUser.id;
-  }
 
   if (!emp) {
     wrap.innerHTML = '<div class="no-emp-screen"><div class="no-emp-icon">👥</div><div class="no-emp-title">Nenhum funcionario ativo. Use o painel do gestor para cadastrar a equipe.</div></div>';
@@ -626,10 +667,14 @@ function mkCol(status, label, dotCls, countCls, empTasks, colBg) {
 function mkCard(task) {
   var cls = 'card' + (task.status === 'doing' ? ' timer-active' : '');
   var flags = buildFlagTags(task);
+  var audit =
+    '<div class="card-assigned">👤 ' + esc(task.assignedBy || 'Sem designação') + '</div>' +
+    '<div class="card-assigned">🧾 Criada por ' + esc(task.createdByName || '—') + '</div>' +
+    '<div class="card-assigned">✍ Última edição ' + esc(task.updatedByName || '—') + (task.lastEditedAt ? ' · ' + esc(fmtDateTime(task.lastEditedAt)) : '') + '</div>';
   return '<div class="' + cls + '" draggable="true" data-id="' + task.id + '" data-status="' + task.status + '" ondragstart="dStart(event,\'' + task.id + '\')" ondragend="dEnd(event)">' +
     '<div class="card-title">' + esc(task.title) + '</div>' +
     (task.desc ? '<div class="card-desc">' + esc(task.desc.length > 80 ? task.desc.slice(0, 80) + '...' : task.desc) + '</div>' : '') +
-    (task.assignedBy ? '<div class="card-assigned">👤 ' + esc(task.assignedBy) + '</div>' : '') +
+    audit +
     (flags ? '<div class="card-flags">' + flags + '</div>' : '') +
     '<button class="card-edit" onclick="openEdit(\'' + task.id + '\')">✎</button>' +
     '<button class="card-del" onclick="deleteTask(\'' + task.id + '\')">✕</button>' +
@@ -807,6 +852,214 @@ function buildUsersSection() {
     '</div>';
 }
 
+function buildAiSection() {
+  var chatHtml = aiChatMessages.length
+    ? aiChatMessages.map(function (item) {
+      var bg = item.role === 'assistant' ? '#f8fafc' : '#eef4fd';
+      var align = item.role === 'assistant' ? 'flex-start' : 'flex-end';
+      return '<div style="display:flex;justify-content:' + align + ';margin-bottom:8px">' +
+        '<div style="max-width:85%;background:' + bg + ';border:1px solid var(--border);border-radius:12px;padding:10px 12px;font-size:12px;line-height:1.55;white-space:pre-wrap">' + esc(item.content) + '</div>' +
+        '</div>';
+    }).join('')
+    : '<div style="font-size:12px;color:var(--text-light)">Pergunte sobre desempenho, gargalos, redistribuição ou próximos passos do time.</div>';
+
+  var feedbackHtml = '<div style="font-size:12px;color:var(--text-light)">Gere uma leitura assistida da produção por período.</div>';
+  if (aiFeedbackLoading) {
+    feedbackHtml = '<div style="font-size:12px;color:var(--text-light)">Gerando feedback...</div>';
+  } else if (aiFeedbackResult) {
+    feedbackHtml =
+      '<div style="display:grid;gap:10px">' +
+      '<div><strong>Resumo:</strong> ' + esc(aiFeedbackResult.summary || '') + '</div>' +
+      buildMiniList('Destaques', aiFeedbackResult.teamHighlights) +
+      buildMiniList('Gargalos', aiFeedbackResult.bottlenecks) +
+      buildMiniList('Recomendações', aiFeedbackResult.recommendations) +
+      '<div style="display:grid;gap:8px">' + (aiFeedbackResult.employees || []).map(function (item) {
+        return '<div style="border:1px solid var(--border);border-radius:10px;padding:10px;background:#fff">' +
+          '<div style="font-weight:600">' + esc(item.name) + ' <span style="font-weight:500;color:var(--text-light)">· ' + esc(item.scoreLabel || '') + '</span></div>' +
+          '<div style="font-size:12px;margin-top:4px">' + esc(item.feedback || '') + '</div>' +
+          '<div style="font-size:11px;color:var(--text-light);margin-top:6px">Risco: ' + esc(item.risk || '') + '</div>' +
+          '<div style="font-size:11px;color:var(--text-light);margin-top:2px">Próximo passo: ' + esc(item.nextStep || '') + '</div>' +
+          '</div>';
+      }).join('') + '</div>' +
+      '</div>';
+  }
+
+  var assignmentHtml = '<div style="font-size:12px;color:var(--text-light)">Preencha o rascunho da tarefa para ranquear os melhores responsáveis.</div>';
+  if (aiAssignmentLoading) {
+    assignmentHtml = '<div style="font-size:12px;color:var(--text-light)">Calculando sugestão...</div>';
+  } else if (aiAssignmentResult) {
+    assignmentHtml =
+      '<div style="display:grid;gap:10px">' +
+      '<div><strong>Síntese:</strong> ' + esc(aiAssignmentResult.summary || '') + '</div>' +
+      (aiAssignmentResult.candidates || []).map(function (candidate, index) {
+        return '<div style="border:1px solid var(--border);border-radius:10px;padding:10px;background:#fff">' +
+          '<div style="display:flex;justify-content:space-between;gap:10px"><strong>' + (index + 1) + '. ' + esc(candidate.name) + '</strong><span style="font-size:11px;color:var(--text-light)">score ' + esc(candidate.score) + '</span></div>' +
+          '<div style="font-size:12px;margin-top:4px">' + esc(candidate.reason || '') + '</div>' +
+          '<div style="margin-top:8px"><button class="btn btn-primary btn-sm" onclick="applyAssignmentCandidate(' + candidate.userId + ')">Usar no cadastro</button></div>' +
+          '</div>';
+      }).join('') +
+      '</div>';
+  }
+
+  var triageHtml = '<div style="font-size:12px;color:var(--text-light)">Cole o texto da inicial para gerar checklist, prioridade e tarefas sugeridas.</div>';
+  if (aiInitialLoading) {
+    triageHtml = '<div style="font-size:12px;color:var(--text-light)">Analisando inicial...</div>';
+  } else if (aiInitialResult) {
+    triageHtml =
+      '<div style="display:grid;gap:10px">' +
+      '<div><strong>Prioridade:</strong> ' + esc(formatPriority(aiInitialResult.priority)) + '</div>' +
+      '<div>' + esc(aiInitialResult.summary || '') + '</div>' +
+      buildMiniList('Riscos', aiInitialResult.risks) +
+      buildMiniList('Checklist', aiInitialResult.checklist) +
+      buildMiniList('Próximos passos', aiInitialResult.nextSteps) +
+      '<div style="display:grid;gap:8px">' + (aiInitialResult.suggestedTasks || []).map(function (task, index) {
+        return '<div style="border:1px solid var(--border);border-radius:10px;padding:10px;background:#fff">' +
+          '<div style="font-weight:600">' + esc(task.title) + '</div>' +
+          '<div style="font-size:12px;margin-top:4px">' + esc(task.description || '') + '</div>' +
+          '<div style="font-size:11px;color:var(--text-light);margin-top:6px">Responsável sugerido: ' + esc(task.assignedToName || '') + '</div>' +
+          '<div style="font-size:11px;color:var(--text-light);margin-top:2px">' + esc(task.reason || '') + '</div>' +
+          '<div style="margin-top:8px"><button class="btn btn-primary btn-sm" onclick="useTriageSuggestion(' + index + ')">Abrir no cadastro</button></div>' +
+          '</div>';
+      }).join('') + '</div>' +
+      (aiInitialResult.runId ? '<div><button class="btn btn-amber btn-sm" onclick="createInitialTasksFromAi()">Criar tarefas sugeridas</button></div>' : '') +
+      '</div>';
+  }
+
+  return '<div style="display:grid;gap:18px;margin-bottom:24px">' +
+    '<div style="border:1px solid var(--border);border-radius:16px;padding:16px;background:linear-gradient(135deg,#f9fbff 0%,#f4f8ff 100%)">' +
+    '<div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start;margin-bottom:12px"><div><div style="font-size:18px;font-weight:700">Assistente IA do Gestor</div><div style="font-size:12px;color:var(--text-light)">Feedback de produção, sugestão de responsáveis e triagem assistida de iniciais. Tudo com confirmação manual.</div></div><div style="font-size:11px;color:var(--text-light)">Exige OPENAI_API_KEY no backend</div></div>' +
+    '<div style="display:grid;grid-template-columns:1.2fr 1fr;gap:14px">' +
+    '<div style="border:1px solid var(--border);border-radius:14px;background:#fff;padding:12px">' +
+    '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px"><strong>Chat administrativo</strong>' + (aiChatPending ? '<span style="font-size:11px;color:var(--text-light)">Respondendo...</span>' : '') + '</div>' +
+    '<div style="min-height:220px;max-height:280px;overflow:auto;margin-bottom:10px">' + chatHtml + '</div>' +
+    '<textarea id="aiChatInput" oninput="aiChatDraft=this.value" placeholder="Ex: quem está sobrecarregado hoje e o que devo redistribuir?" style="width:100%;min-height:78px;border:1px solid var(--border);border-radius:10px;padding:10px;font:inherit">' + esc(aiChatDraft) + '</textarea>' +
+    '<div style="display:flex;justify-content:flex-end;margin-top:8px"><button class="btn btn-primary btn-sm" onclick="runAiChat()">Enviar</button></div>' +
+    '</div>' +
+    '<div style="display:grid;gap:12px">' +
+    '<div style="border:1px solid var(--border);border-radius:14px;background:#fff;padding:12px"><div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:10px"><strong>Feedback de performance</strong><div style="display:flex;gap:8px;align-items:center"><select id="aiFeedbackPeriod" onchange="aiFeedbackPeriod=this.value" style="border:1px solid var(--border);border-radius:8px;padding:6px 8px"><option value="today"' + (aiFeedbackPeriod === 'today' ? ' selected' : '') + '>Hoje</option><option value="7d"' + (aiFeedbackPeriod === '7d' ? ' selected' : '') + '>7 dias</option><option value="30d"' + (aiFeedbackPeriod === '30d' ? ' selected' : '') + '>30 dias</option><option value="history"' + (aiFeedbackPeriod === 'history' ? ' selected' : '') + '>Histórico</option></select><button class="btn btn-primary btn-sm" onclick="runAiFeedback()">Gerar</button></div></div>' + feedbackHtml + '</div>' +
+    '<div style="border:1px solid var(--border);border-radius:14px;background:#fff;padding:12px"><div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:10px"><strong>Distribuição assistida</strong><button class="btn btn-primary btn-sm" onclick="runAiAssignment()">Sugerir</button></div><input id="aiAssignTitle" value="' + esc(aiAssignmentDraft.title) + '" oninput="aiAssignmentDraft.title=this.value" placeholder="Título da tarefa" style="width:100%;border:1px solid var(--border);border-radius:8px;padding:8px 10px;margin-bottom:8px;font:inherit" /><textarea id="aiAssignDesc" oninput="aiAssignmentDraft.description=this.value" placeholder="Descrição / contexto da tarefa" style="width:100%;min-height:74px;border:1px solid var(--border);border-radius:8px;padding:8px 10px;margin-bottom:8px;font:inherit">' + esc(aiAssignmentDraft.description) + '</textarea><input id="aiAssignBy" value="' + esc(aiAssignmentDraft.assignedBy) + '" oninput="aiAssignmentDraft.assignedBy=this.value" placeholder="Designado por" style="width:100%;border:1px solid var(--border);border-radius:8px;padding:8px 10px;font:inherit" />' + '<div style="margin-top:10px">' + assignmentHtml + '</div></div>' +
+    '<div style="border:1px solid var(--border);border-radius:14px;background:#fff;padding:12px"><div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:10px"><strong>Triagem de iniciais</strong><button class="btn btn-primary btn-sm" onclick="runAiInitialTriage()">Analisar</button></div><input id="aiInitialTitle" value="' + esc(aiInitialDraft.title) + '" oninput="aiInitialDraft.title=this.value" placeholder="Título / assunto do caso" style="width:100%;border:1px solid var(--border);border-radius:8px;padding:8px 10px;margin-bottom:8px;font:inherit" /><textarea id="aiInitialText" oninput="aiInitialDraft.initialText=this.value" placeholder="Cole aqui o texto da inicial" style="width:100%;min-height:120px;border:1px solid var(--border);border-radius:8px;padding:8px 10px;margin-bottom:8px;font:inherit">' + esc(aiInitialDraft.initialText) + '</textarea><textarea id="aiInitialContext" oninput="aiInitialDraft.contextNote=this.value" placeholder="Contexto extra opcional (cliente, urgência, prazo, observações)" style="width:100%;min-height:58px;border:1px solid var(--border);border-radius:8px;padding:8px 10px;font:inherit">' + esc(aiInitialDraft.contextNote) + '</textarea><div style="margin-top:10px">' + triageHtml + '</div></div>' +
+    '</div>' +
+    '</div>' +
+    '</div>';
+}
+
+function buildMiniList(title, items) {
+  var list = Array.isArray(items) ? items.filter(Boolean) : [];
+  if (!list.length) return '';
+  return '<div><strong>' + esc(title) + ':</strong><ul style="margin:6px 0 0 18px;padding:0;display:grid;gap:4px;font-size:12px">' + list.map(function (item) {
+    return '<li>' + esc(item) + '</li>';
+  }).join('') + '</ul></div>';
+}
+
+function formatPriority(value) {
+  var labels = { baixa: 'Baixa', media: 'Média', alta: 'Alta', critica: 'Crítica' };
+  return labels[value] || value || 'Média';
+}
+
+async function runAiFeedback() {
+  aiFeedbackLoading = true;
+  renderMgr();
+  try {
+    aiFeedbackResult = await api('POST', '/manager/ai/feedback', { period: aiFeedbackPeriod });
+  } catch (error) {
+    showToast(error.message);
+  } finally {
+    aiFeedbackLoading = false;
+    renderMgr();
+  }
+}
+
+async function runAiAssignment() {
+  aiAssignmentLoading = true;
+  renderMgr();
+  try {
+    aiAssignmentResult = await api('POST', '/manager/ai/task-assignment', aiAssignmentDraft);
+  } catch (error) {
+    showToast(error.message);
+  } finally {
+    aiAssignmentLoading = false;
+    renderMgr();
+  }
+}
+
+async function runAiInitialTriage() {
+  aiInitialLoading = true;
+  renderMgr();
+  try {
+    aiInitialResult = await api('POST', '/manager/ai/initial-triage', aiInitialDraft);
+  } catch (error) {
+    showToast(error.message);
+  } finally {
+    aiInitialLoading = false;
+    renderMgr();
+  }
+}
+
+async function runAiChat() {
+  var message = (document.getElementById('aiChatInput') ? document.getElementById('aiChatInput').value : aiChatDraft).trim();
+  if (!message || aiChatPending) return;
+  aiChatMessages.push({ role: 'user', content: message });
+  aiChatDraft = '';
+  aiChatPending = true;
+  renderMgr();
+  try {
+    var reply = await api('POST', '/manager/ai/chat', {
+      message: message,
+      history: aiChatMessages.slice(-8)
+    });
+    aiChatMessages.push({ role: 'assistant', content: reply.reply || 'Sem resposta da IA.' });
+    if (reply.suggestions && reply.suggestions.length) {
+      aiChatMessages.push({ role: 'assistant', content: 'Sugestões:\n- ' + reply.suggestions.join('\n- ') });
+    }
+    if (reply.alerts && reply.alerts.length) {
+      aiChatMessages.push({ role: 'assistant', content: 'Alertas:\n- ' + reply.alerts.join('\n- ') });
+    }
+  } catch (error) {
+    showToast(error.message);
+  } finally {
+    aiChatPending = false;
+    renderMgr();
+  }
+}
+
+function applyAssignmentCandidate(userId) {
+  var chosen = employees.filter(function (emp) { return emp.id === userId; })[0];
+  if (!chosen) return showToast('Responsável não encontrado');
+  activeId = chosen.id;
+  switchTab('team');
+  openAdd('todo');
+  document.getElementById('iEmp').value = String(chosen.id);
+  document.getElementById('iTitle').value = aiAssignmentDraft.title || '';
+  document.getElementById('iDesc').value = aiAssignmentDraft.description || '';
+  if (aiAssignmentDraft.assignedBy) document.getElementById('iAssignedBy').value = aiAssignmentDraft.assignedBy;
+}
+
+function useTriageSuggestion(index) {
+  if (!aiInitialResult || !aiInitialResult.suggestedTasks || !aiInitialResult.suggestedTasks[index]) return;
+  var task = aiInitialResult.suggestedTasks[index];
+  activeId = task.assignedToUserId;
+  switchTab('team');
+  openAdd('todo');
+  document.getElementById('iEmp').value = String(task.assignedToUserId);
+  document.getElementById('iTitle').value = task.title || '';
+  document.getElementById('iDesc').value = task.description || '';
+  document.getElementById('iAssignedBy').value = currentUser ? currentUser.name : '';
+}
+
+async function createInitialTasksFromAi() {
+  if (!aiInitialResult || !aiInitialResult.runId) return;
+  try {
+    await api('POST', '/manager/ai/initial-triage/' + aiInitialResult.runId + '/create-tasks');
+    await refreshWorkspace(true);
+    renderTeam();
+    renderMgr();
+    showToast('Tarefas sugeridas criadas');
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
 async function buildDashboard() {
   await loadManagerUsers();
 
@@ -882,6 +1135,7 @@ async function buildDashboard() {
 
   var historyHtml = await buildHistoryPanel();
   var usersHtml = buildUsersSection();
+  var aiHtml = buildAiSection();
   var dateStr = new Date().toLocaleDateString('pt-BR', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
   var pwSection = '<div class="pw-section"><div class="pw-row">' +
     '<div class="pw-field"><label>Nova senha</label><input id="pwNew" type="password" placeholder="Minimo 6 caracteres" /></div>' +
@@ -903,6 +1157,8 @@ async function buildDashboard() {
     kpis +
     '<div class="section-title">Equipe e Acessos</div>' +
     usersHtml +
+    '<div class="section-title">Assistente IA do Gestor</div>' +
+    aiHtml +
     '<div class="section-title">Visao Geral da Equipe</div>' +
     '<div class="emp-table"><div class="et-head"><span>Funcionario</span><span>Total</span><span>Ativo</span><span>Concluido</span><span>Progresso</span></div>' + (employeeRows || '<div style="padding:16px;text-align:center;color:var(--text-light);font-size:12px">Nenhuma tarefa.</div>') + '</div>' +
     '<div class="section-title">Relatorio por Funcionario</div>' +
@@ -1194,6 +1450,16 @@ function checkAutoClose() {
   }
 }
 
+function isManagerInteractionActive() {
+  var active = document.activeElement;
+  if (!active) return false;
+  if (document.querySelector('.overlay.open')) return true;
+  var tag = active.tagName;
+  if (tag !== 'INPUT' && tag !== 'TEXTAREA' && tag !== 'SELECT') return false;
+  var mgrPanel = document.getElementById('mgrPanel');
+  return !!(mgrPanel && mgrPanel.contains(active));
+}
+
 document.addEventListener('keydown', function (event) {
   if (event.key === 'Enter' && document.getElementById('loginUser') === document.activeElement) doLogin();
   if (event.key === 'Enter' && document.getElementById('loginPass') === document.activeElement) doLogin();
@@ -1206,5 +1472,7 @@ document.addEventListener('keydown', function (event) {
 });
 
 setInterval(function () { if (currentTab === 'all') renderAll(); }, 15000);
-setInterval(function () { if (currentTab === 'mgr' && mgrUnlocked) renderMgr(); }, 10000);
+setInterval(function () {
+  if (currentTab === 'mgr' && mgrUnlocked && !aiChatPending && !isManagerInteractionActive()) renderMgr();
+}, 10000);
 setInterval(updateDate, 60000);

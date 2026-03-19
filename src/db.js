@@ -36,6 +36,8 @@ const SCHEMA_SQL = `
     notes TEXT NOT NULL DEFAULT '',
     assigned_by TEXT NOT NULL DEFAULT '',
     user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_by_user_id BIGINT REFERENCES users(id),
+    updated_by_user_id BIGINT REFERENCES users(id),
     status TEXT NOT NULL DEFAULT 'todo' CHECK (status IN ('todo', 'doing', 'done')),
     elapsed BIGINT NOT NULL DEFAULT 0,
     timer_start BIGINT,
@@ -46,6 +48,7 @@ const SCHEMA_SQL = `
     flag_dispensa BOOLEAN NOT NULL DEFAULT FALSE,
     flag_protreal BOOLEAN NOT NULL DEFAULT FALSE,
     flag_naoaplic BOOLEAN NOT NULL DEFAULT FALSE,
+    last_edited_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   );
@@ -58,9 +61,33 @@ const SCHEMA_SQL = `
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   );
 
+  CREATE TABLE IF NOT EXISTS task_activity (
+    id BIGSERIAL PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    action TEXT NOT NULL CHECK (action IN ('create', 'update', 'status_change', 'reassign', 'delete')),
+    actor_user_id BIGINT REFERENCES users(id),
+    target_user_id BIGINT REFERENCES users(id),
+    before_json JSONB,
+    after_json JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
+
+  CREATE TABLE IF NOT EXISTS ai_runs (
+    id BIGSERIAL PRIMARY KEY,
+    kind TEXT NOT NULL CHECK (kind IN ('feedback', 'assignment', 'initial_triage', 'chat')),
+    created_by_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    input_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    output_json JSONB,
+    status TEXT NOT NULL DEFAULT 'completed' CHECK (status IN ('pending', 'completed', 'failed')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
+
   CREATE INDEX IF NOT EXISTS idx_tasks_user_id ON tasks(user_id);
   CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
   CREATE INDEX IF NOT EXISTS idx_users_role_active ON users(role, is_active);
+  CREATE INDEX IF NOT EXISTS idx_task_activity_task_id ON task_activity(task_id);
+  CREATE INDEX IF NOT EXISTS idx_task_activity_created_at ON task_activity(created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_ai_runs_kind_created_at ON ai_runs(kind, created_at DESC);
 `;
 
 let pool;
@@ -115,6 +142,7 @@ async function initDb() {
   if (!initPromise) {
     initPromise = withClient(async (client) => {
       await client.query(SCHEMA_SQL);
+      await runSchemaUpgrades(client);
       await bootstrapAdmin(client);
       return true;
     }).catch((error) => {
@@ -160,6 +188,33 @@ async function bootstrapAdmin(client) {
     `,
     [adminUsername, adminName, password, theme.color, theme.pastel, theme.colBg, theme.boardBg]
   );
+}
+
+async function runSchemaUpgrades(client) {
+  await client.query(`
+    ALTER TABLE tasks
+    ADD COLUMN IF NOT EXISTS created_by_user_id BIGINT REFERENCES users(id)
+  `);
+  await client.query(`
+    ALTER TABLE tasks
+    ADD COLUMN IF NOT EXISTS updated_by_user_id BIGINT REFERENCES users(id)
+  `);
+  await client.query(`
+    ALTER TABLE tasks
+    ADD COLUMN IF NOT EXISTS last_edited_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  `);
+
+  await client.query(`
+    UPDATE tasks
+    SET
+      created_by_user_id = COALESCE(created_by_user_id, user_id),
+      updated_by_user_id = COALESCE(updated_by_user_id, user_id),
+      last_edited_at = COALESCE(last_edited_at, updated_at, created_at, NOW())
+    WHERE
+      created_by_user_id IS NULL OR
+      updated_by_user_id IS NULL OR
+      last_edited_at IS NULL
+  `);
 }
 
 function normalizeUsername(value) {

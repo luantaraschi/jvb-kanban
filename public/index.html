@@ -419,7 +419,10 @@ body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--tex
     <div class="field"><label>Título *</label><input id="iTitle" placeholder="Nome da tarefa" /></div>
     <div class="field"><label>Descrição *</label><textarea id="iDesc" placeholder="O que precisa ser feito?"></textarea></div>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
-      <div class="field" style="margin-bottom:0"><label>Responsável</label><input id="iEmp" readonly /></div>
+      <div class="field" style="margin-bottom:0">
+        <label>Responsável</label>
+        <select id="iEmp"></select>
+      </div>
       <div class="field" style="margin-bottom:0">
         <label>Designado por *</label>
         <select id="iAssignedBy">
@@ -458,6 +461,10 @@ body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--tex
     <div class="field"><label>Descrição</label><textarea id="eDescVal"></textarea></div>
     <div class="field"><label>Como foi feito / Observações</label><textarea id="eNotesVal" style="min-height:52px"></textarea></div>
     <div class="field">
+      <label>Responsável</label>
+      <select id="eEmpVal"></select>
+    </div>
+    <div class="field">
       <label>Designado por</label>
       <select id="eAssignedVal">
         <option value="">Selecione...</option>
@@ -471,6 +478,7 @@ body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--tex
         <option value="João">João</option>
       </select>
     </div>
+    <div class="modal-note" id="eAuditInfo">Criada por — · última edição —</div>
     <div class="modal-actions">
       <button class="btn btn-ghost" onclick="overlayClose('editModal')">Cancelar</button>
       <button class="btn btn-primary" onclick="saveEdit()">Salvar</button>

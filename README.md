@@ -20,6 +20,9 @@ Sistema de produtividade para equipe juridica, com board Kanban, painel do gesto
   - ativar ou desativar usuario
   - redefinir senha
 - o gestor consegue criar tarefa para o funcionario atualmente selecionado no board
+- todos os membros autenticados agora colaboram no board inteiro
+- as tarefas guardam criador e ultimo editor
+- o painel do gestor agora tem um workspace de IA para feedback, distribuicao e triagem de iniciais
 
 ## Variaveis de ambiente
 
@@ -31,6 +34,10 @@ JWT_SECRET=...
 ADMIN_NAME=Gestor
 ADMIN_USERNAME=gestor
 ADMIN_PASSWORD=senha_forte
+AI_ENABLED=true
+OPENAI_API_KEY=...
+OPENAI_MODEL=gpt-5-mini
+AI_TIMEOUT_MS=45000
 PORT=3000
 NODE_ENV=development
 ```
@@ -102,3 +109,8 @@ Rotas:
 - `PUT /api/manager/users/:id`
 - `PATCH /api/manager/users/:id/status`
 - `PUT /api/manager/users/:id/password`
+- `POST /api/manager/ai/chat`
+- `POST /api/manager/ai/feedback`
+- `POST /api/manager/ai/task-assignment`
+- `POST /api/manager/ai/initial-triage`
+- `POST /api/manager/ai/initial-triage/:runId/create-tasks`

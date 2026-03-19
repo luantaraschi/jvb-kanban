@@ -2,6 +2,13 @@
 
 const bcrypt = require('bcryptjs');
 const express = require('express');
+const {
+  generateFeedback,
+  isAiEnabled,
+  runManagerChat,
+  suggestTaskAssignment,
+  triageInitial
+} = require('./ai');
 const { normalizeUsername, pickTheme, query, withTransaction } = require('./db');
 const { requireAuth, requireManager, signToken } = require('./auth');
 
@@ -94,14 +101,6 @@ router.post('/auth/change-password', requireAuth, asyncHandler(async (req, res) 
 }));
 
 router.get('/tasks', requireAuth, asyncHandler(async (req, res) => {
-  const params = [];
-  let where = '';
-
-  if (req.user.role !== 'manager') {
-    where = 'WHERE t.user_id = $1';
-    params.push(req.user.id);
-  }
-
   const result = await query(
     `
       SELECT
@@ -110,13 +109,16 @@ router.get('/tasks', requireAuth, asyncHandler(async (req, res) => {
         u.color,
         u.pastel,
         u.col_bg,
-        u.board_bg
+        u.board_bg,
+        creator.name AS created_by_name,
+        updater.name AS updated_by_name
       FROM tasks t
       JOIN users u ON u.id = t.user_id
-      ${where}
+      LEFT JOIN users creator ON creator.id = t.created_by_user_id
+      LEFT JOIN users updater ON updater.id = t.updated_by_user_id
+      WHERE u.role = 'employee' AND u.is_active = TRUE
       ORDER BY t.created_at DESC
-    `,
-    params
+    `
   );
 
   res.json(result.rows.map(normalizeTask));
@@ -134,7 +136,7 @@ router.post('/tasks', requireAuth, asyncHandler(async (req, res) => {
     return res.status(400).json({ error: 'Titulo obrigatorio' });
   }
 
-  const userId = req.user.role === 'manager' ? requestedUserId : req.user.id;
+  const userId = requestedUserId || req.user.id;
   const userResult = await query(
     `
       SELECT id, name, role, is_active
@@ -150,7 +152,7 @@ router.post('/tasks', requireAuth, asyncHandler(async (req, res) => {
     return res.status(404).json({ error: 'Responsavel nao encontrado ou inativo' });
   }
 
-  if (owner.role !== 'employee' && req.user.role === 'manager') {
+  if (owner.role !== 'employee') {
     return res.status(400).json({ error: 'As tarefas devem ser atribuidas a funcionarios' });
   }
 
@@ -161,14 +163,22 @@ router.post('/tasks', requireAuth, asyncHandler(async (req, res) => {
   await query(
     `
       INSERT INTO tasks (
-        id, title, description, notes, assigned_by, user_id, status, timer_start
+        id, title, description, notes, assigned_by, user_id, created_by_user_id, updated_by_user_id, status, timer_start
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
     `,
-    [taskId, title, description, notes, assignedBy, userId, status, timerStart]
+    [taskId, title, description, notes, assignedBy, userId, req.user.id, req.user.id, status, timerStart]
   );
 
   const result = await query(taskSelectById(), [taskId]);
+  await logTaskActivity({
+    taskId,
+    action: 'create',
+    actorUserId: req.user.id,
+    targetUserId: userId,
+    before: null,
+    after: taskSnapshot(result.rows[0])
+  });
   res.status(201).json(normalizeTask(result.rows[0]));
 }));
 
@@ -178,14 +188,15 @@ router.put('/tasks/:id', requireAuth, asyncHandler(async (req, res) => {
     return res.status(404).json({ error: 'Tarefa nao encontrada' });
   }
 
-  if (req.user.role !== 'manager' && Number(task.user_id) !== req.user.id) {
-    return res.status(403).json({ error: 'Sem permissao' });
-  }
-
   const title = cleanText(req.body.title) || task.title;
+  const requestedUserId = Number(req.body.userId || task.user_id);
   if (!title) {
     return res.status(400).json({ error: 'Titulo obrigatorio' });
   }
+
+  const owner = await findEmployeeTarget(requestedUserId);
+  const action = Number(task.user_id) !== Number(requestedUserId) ? 'reassign' : 'update';
+  const before = taskSnapshot(task);
 
   await query(
     `
@@ -195,19 +206,32 @@ router.put('/tasks/:id', requireAuth, asyncHandler(async (req, res) => {
         description = $2,
         notes = $3,
         assigned_by = $4,
+        user_id = $5,
+        updated_by_user_id = $6,
+        last_edited_at = NOW(),
         updated_at = NOW()
-      WHERE id = $5
+      WHERE id = $7
     `,
     [
       title,
       cleanNullableText(req.body.description, task.description),
       cleanNullableText(req.body.notes, task.notes),
       cleanNullableText(req.body.assignedBy, task.assigned_by),
+      owner.id,
+      req.user.id,
       req.params.id
     ]
   );
 
   const result = await query(taskSelectById(), [req.params.id]);
+  await logTaskActivity({
+    taskId: req.params.id,
+    action,
+    actorUserId: req.user.id,
+    targetUserId: owner.id,
+    before,
+    after: taskSnapshot(result.rows[0])
+  });
   res.json(normalizeTask(result.rows[0]));
 }));
 
@@ -215,10 +239,6 @@ router.patch('/tasks/:id/status', requireAuth, asyncHandler(async (req, res) => 
   const task = await findTask(req.params.id);
   if (!task) {
     return res.status(404).json({ error: 'Tarefa nao encontrada' });
-  }
-
-  if (req.user.role !== 'manager' && Number(task.user_id) !== req.user.id) {
-    return res.status(403).json({ error: 'Sem permissao' });
   }
 
   const newStatus = cleanStatus(req.body.newStatus);
@@ -261,8 +281,10 @@ router.patch('/tasks/:id/status', requireAuth, asyncHandler(async (req, res) => 
         flag_dispensa = $8,
         flag_protreal = $9,
         flag_naoaplic = $10,
+        updated_by_user_id = $11,
+        last_edited_at = NOW(),
         updated_at = NOW()
-      WHERE id = $11
+      WHERE id = $12
     `,
     [
       newStatus,
@@ -275,11 +297,20 @@ router.patch('/tasks/:id/status', requireAuth, asyncHandler(async (req, res) => 
       !!req.body.flagDispensa,
       !!req.body.flagProtreal,
       !!req.body.flagNaoAplic,
+      req.user.id,
       req.params.id
     ]
   );
 
   const result = await query(taskSelectById(), [req.params.id]);
+  await logTaskActivity({
+    taskId: req.params.id,
+    action: 'status_change',
+    actorUserId: req.user.id,
+    targetUserId: Number(task.user_id),
+    before: taskSnapshot(task),
+    after: taskSnapshot(result.rows[0])
+  });
   res.json(normalizeTask(result.rows[0]));
 }));
 
@@ -289,10 +320,14 @@ router.delete('/tasks/:id', requireAuth, asyncHandler(async (req, res) => {
     return res.status(404).json({ error: 'Tarefa nao encontrada' });
   }
 
-  if (req.user.role !== 'manager' && Number(task.user_id) !== req.user.id) {
-    return res.status(403).json({ error: 'Sem permissao' });
-  }
-
+  await logTaskActivity({
+    taskId: req.params.id,
+    action: 'delete',
+    actorUserId: req.user.id,
+    targetUserId: Number(task.user_id),
+    before: taskSnapshot(task),
+    after: null
+  });
   await query('DELETE FROM tasks WHERE id = $1', [req.params.id]);
   res.json({ ok: true });
 }));
@@ -315,10 +350,15 @@ router.get('/team', requireAuth, asyncHandler(async (req, res) => {
     result.rows.map(async (emp) => {
       const taskResult = await query(
         `
-          SELECT *
-          FROM tasks
-          WHERE user_id = $1 AND status IN ('todo', 'doing')
-          ORDER BY created_at DESC
+          SELECT
+            t.*,
+            creator.name AS created_by_name,
+            updater.name AS updated_by_name
+          FROM tasks t
+          LEFT JOIN users creator ON creator.id = t.created_by_user_id
+          LEFT JOIN users updater ON updater.id = t.updated_by_user_id
+          WHERE t.user_id = $1 AND t.status IN ('todo', 'doing')
+          ORDER BY t.created_at DESC
         `,
         [emp.id]
       );
@@ -615,6 +655,186 @@ router.put('/manager/users/:id/password', requireManager, asyncHandler(async (re
   res.json({ ok: true });
 }));
 
+router.post('/manager/ai/chat', requireManager, asyncHandler(async (req, res) => {
+  const inputJson = {
+    message: cleanText(req.body.message),
+    history: Array.isArray(req.body.history) ? req.body.history.slice(-8) : []
+  };
+
+  try {
+    const outputJson = await runManagerChat(inputJson);
+    const run = await persistAiRun({
+      kind: 'chat',
+      createdByUserId: req.user.id,
+      inputJson,
+      outputJson,
+      status: 'completed'
+    });
+    res.json(Object.assign({ runId: run.id, enabled: isAiEnabled() }, outputJson));
+  } catch (error) {
+    await persistAiRun({
+      kind: 'chat',
+      createdByUserId: req.user.id,
+      inputJson,
+      outputJson: { error: error.message },
+      status: 'failed'
+    });
+    throw error;
+  }
+}));
+
+router.post('/manager/ai/feedback', requireManager, asyncHandler(async (req, res) => {
+  const inputJson = { period: req.body.period };
+
+  try {
+    const outputJson = await generateFeedback(inputJson);
+    const run = await persistAiRun({
+      kind: 'feedback',
+      createdByUserId: req.user.id,
+      inputJson,
+      outputJson,
+      status: 'completed'
+    });
+    res.json(Object.assign({ runId: run.id, enabled: isAiEnabled() }, outputJson));
+  } catch (error) {
+    await persistAiRun({
+      kind: 'feedback',
+      createdByUserId: req.user.id,
+      inputJson,
+      outputJson: { error: error.message },
+      status: 'failed'
+    });
+    throw error;
+  }
+}));
+
+router.post('/manager/ai/task-assignment', requireManager, asyncHandler(async (req, res) => {
+  const inputJson = {
+    title: cleanText(req.body.title),
+    description: cleanText(req.body.description),
+    assignedBy: cleanText(req.body.assignedBy)
+  };
+
+  try {
+    const outputJson = await suggestTaskAssignment(inputJson);
+    const run = await persistAiRun({
+      kind: 'assignment',
+      createdByUserId: req.user.id,
+      inputJson,
+      outputJson,
+      status: 'completed'
+    });
+    res.json(Object.assign({ runId: run.id, enabled: isAiEnabled() }, outputJson));
+  } catch (error) {
+    await persistAiRun({
+      kind: 'assignment',
+      createdByUserId: req.user.id,
+      inputJson,
+      outputJson: { error: error.message },
+      status: 'failed'
+    });
+    throw error;
+  }
+}));
+
+router.post('/manager/ai/initial-triage', requireManager, asyncHandler(async (req, res) => {
+  const inputJson = {
+    title: cleanText(req.body.title),
+    initialText: cleanText(req.body.initialText),
+    contextNote: cleanText(req.body.contextNote)
+  };
+
+  try {
+    const outputJson = await triageInitial(inputJson);
+    const run = await persistAiRun({
+      kind: 'initial_triage',
+      createdByUserId: req.user.id,
+      inputJson,
+      outputJson,
+      status: 'completed'
+    });
+    res.json(Object.assign({ runId: run.id, enabled: isAiEnabled() }, outputJson));
+  } catch (error) {
+    await persistAiRun({
+      kind: 'initial_triage',
+      createdByUserId: req.user.id,
+      inputJson,
+      outputJson: { error: error.message },
+      status: 'failed'
+    });
+    throw error;
+  }
+}));
+
+router.post('/manager/ai/initial-triage/:runId/create-tasks', requireManager, asyncHandler(async (req, res) => {
+  const run = await findAiRun(req.params.runId, 'initial_triage');
+  if (!run) {
+    return res.status(404).json({ error: 'Analise de inicial nao encontrada' });
+  }
+  if (Number(run.created_by_user_id) !== req.user.id) {
+    return res.status(403).json({ error: 'Esta analise pertence a outra sessao de gestor' });
+  }
+
+  const output = typeof run.output_json === 'string' ? JSON.parse(run.output_json) : run.output_json;
+  const suggestedTasks = Array.isArray(output && output.suggestedTasks) ? output.suggestedTasks : [];
+  if (!suggestedTasks.length) {
+    return res.status(400).json({ error: 'Esta analise nao possui tarefas sugeridas' });
+  }
+
+  const created = await withTransaction(async (client) => {
+    const inserted = [];
+    for (const suggestion of suggestedTasks) {
+      const owner = await client.query(
+        `
+          SELECT id, role, is_active
+          FROM users
+          WHERE id = $1
+          LIMIT 1
+        `,
+        [Number(suggestion.assignedToUserId)]
+      );
+      const user = owner.rows[0];
+      if (!user || !user.is_active || user.role !== 'employee') {
+        continue;
+      }
+
+      const taskId = uid();
+      await client.query(
+        `
+          INSERT INTO tasks (
+            id, title, description, notes, assigned_by, user_id, created_by_user_id, updated_by_user_id, status, timer_start
+          )
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'todo', NULL)
+        `,
+        [
+          taskId,
+          cleanText(suggestion.title) || 'Tarefa sugerida',
+          cleanText(suggestion.description) || 'Gerada a partir da triagem da inicial',
+          '',
+          req.user.name,
+          Number(suggestion.assignedToUserId),
+          req.user.id,
+          req.user.id
+        ]
+      );
+
+      const selected = await client.query(taskSelectById(), [taskId]);
+      const taskRow = selected.rows[0];
+      inserted.push(normalizeTask(taskRow));
+      await client.query(
+        `
+          INSERT INTO task_activity (task_id, action, actor_user_id, target_user_id, before_json, after_json)
+          VALUES ($1, 'create', $2, $3, NULL, $4::jsonb)
+        `,
+        [taskId, req.user.id, Number(suggestion.assignedToUserId), JSON.stringify(taskSnapshot(taskRow))]
+      );
+    }
+    return inserted;
+  });
+
+  res.status(201).json({ ok: true, created });
+}));
+
 function asyncHandler(fn) {
   return function wrapped(req, res, next) {
     Promise.resolve(fn(req, res, next)).catch(next);
@@ -665,6 +885,26 @@ async function findTask(id) {
   return result.rows[0] || null;
 }
 
+async function findEmployeeTarget(id) {
+  const result = await query(
+    `
+      SELECT id, name, role, is_active
+      FROM users
+      WHERE id = $1
+      LIMIT 1
+    `,
+    [id]
+  );
+  const user = result.rows[0];
+  if (!user || !user.is_active) {
+    throw httpError(404, 'Responsavel nao encontrado ou inativo');
+  }
+  if (user.role !== 'employee') {
+    throw httpError(400, 'As tarefas devem ser atribuidas a funcionarios');
+  }
+  return user;
+}
+
 async function findUser(id) {
   const result = await query(
     `
@@ -674,6 +914,26 @@ async function findUser(id) {
       LIMIT 1
     `,
     [id]
+  );
+  return result.rows[0] || null;
+}
+
+async function findAiRun(id, kind) {
+  const params = [id];
+  let where = 'WHERE id = $1';
+  if (kind) {
+    params.push(kind);
+    where += ' AND kind = $2';
+  }
+
+  const result = await query(
+    `
+      SELECT id, kind, created_by_user_id, input_json, output_json, status, created_at
+      FROM ai_runs
+      ${where}
+      LIMIT 1
+    `,
+    params
   );
   return result.rows[0] || null;
 }
@@ -726,9 +986,13 @@ function taskSelectById() {
       u.color,
       u.pastel,
       u.col_bg,
-      u.board_bg
+      u.board_bg,
+      creator.name AS created_by_name,
+      updater.name AS updated_by_name
     FROM tasks t
     JOIN users u ON u.id = t.user_id
+    LEFT JOIN users creator ON creator.id = t.created_by_user_id
+    LEFT JOIN users updater ON updater.id = t.updated_by_user_id
     WHERE t.id = $1
     LIMIT 1
   `;
@@ -758,6 +1022,11 @@ function normalizeTask(task) {
     assignedBy: task.assigned_by,
     empId: Number(task.user_id),
     empName: task.emp_name,
+    createdByUserId: task.created_by_user_id == null ? null : Number(task.created_by_user_id),
+    createdByName: task.created_by_name || null,
+    updatedByUserId: task.updated_by_user_id == null ? null : Number(task.updated_by_user_id),
+    updatedByName: task.updated_by_name || null,
+    lastEditedAt: task.last_edited_at || task.updated_at || null,
     status: task.status,
     elapsed: Number(task.elapsed || 0),
     timerStart: task.timer_start == null ? null : Number(task.timer_start),
@@ -784,6 +1053,11 @@ function normalizeTaskFromTaskOnly(task) {
     notes: task.notes,
     assignedBy: task.assigned_by,
     empId: Number(task.user_id),
+    createdByUserId: task.created_by_user_id == null ? null : Number(task.created_by_user_id),
+    createdByName: task.created_by_name || null,
+    updatedByUserId: task.updated_by_user_id == null ? null : Number(task.updated_by_user_id),
+    updatedByName: task.updated_by_name || null,
+    lastEditedAt: task.last_edited_at || task.updated_at || null,
     status: task.status,
     elapsed: Number(task.elapsed || 0),
     timerStart: task.timer_start == null ? null : Number(task.timer_start),
@@ -800,6 +1074,73 @@ function normalizeTaskFromTaskOnly(task) {
 
 function uid() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+}
+
+async function logTaskActivity(input) {
+  await query(
+    `
+      INSERT INTO task_activity (
+        task_id,
+        action,
+        actor_user_id,
+        target_user_id,
+        before_json,
+        after_json
+      )
+      VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb)
+    `,
+    [
+      input.taskId,
+      input.action,
+      input.actorUserId,
+      input.targetUserId,
+      input.before ? JSON.stringify(input.before) : null,
+      input.after ? JSON.stringify(input.after) : null
+    ]
+  );
+}
+
+async function persistAiRun(input) {
+  const result = await query(
+    `
+      INSERT INTO ai_runs (kind, created_by_user_id, input_json, output_json, status)
+      VALUES ($1, $2, $3::jsonb, $4::jsonb, $5)
+      RETURNING id, kind, created_by_user_id, status, created_at
+    `,
+    [
+      input.kind,
+      input.createdByUserId,
+      JSON.stringify(input.inputJson || {}),
+      input.outputJson == null ? null : JSON.stringify(input.outputJson),
+      input.status || 'completed'
+    ]
+  );
+  return result.rows[0];
+}
+
+function taskSnapshot(task) {
+  if (!task) return null;
+  return {
+    id: task.id,
+    title: task.title,
+    description: task.description,
+    notes: task.notes,
+    assignedBy: task.assigned_by,
+    userId: Number(task.user_id),
+    createdByUserId: task.created_by_user_id == null ? null : Number(task.created_by_user_id),
+    updatedByUserId: task.updated_by_user_id == null ? null : Number(task.updated_by_user_id),
+    status: task.status,
+    elapsed: Number(task.elapsed || 0),
+    timerStart: task.timer_start == null ? null : Number(task.timer_start),
+    completedAt: task.completed_at,
+    needsRevisao: !!task.needs_revisao,
+    needsProtocolo: !!task.needs_protocolo,
+    flagAgendei: !!task.flag_agendei,
+    flagDispensa: !!task.flag_dispensa,
+    flagProtreal: !!task.flag_protreal,
+    flagNaoAplic: !!task.flag_naoaplic,
+    lastEditedAt: task.last_edited_at || task.updated_at || null
+  };
 }
 
 function todayStr() {
