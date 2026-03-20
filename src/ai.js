@@ -381,7 +381,7 @@ async function buildManagerContext(input) {
 
   const latestSnapshotResult = await query(
     `
-      SELECT period, source, generated_at, executive_summary, alerts, recommendations, load_notes
+      SELECT period, source, generated_at, report_json
       FROM ai_report_snapshots
       WHERE period = $1
       ORDER BY generated_at DESC
@@ -493,15 +493,19 @@ async function buildManagerContext(input) {
       return all;
     }, []),
     latestSnapshot: latestSnapshotResult.rows[0]
-      ? {
-        period: latestSnapshotResult.rows[0].period,
-        source: latestSnapshotResult.rows[0].source,
-        generatedAt: latestSnapshotResult.rows[0].generated_at,
-        executiveSummary: latestSnapshotResult.rows[0].executive_summary,
-        alerts: ensureStringArray(latestSnapshotResult.rows[0].alerts),
-        recommendations: ensureStringArray(latestSnapshotResult.rows[0].recommendations),
-        loadNotes: ensureStringArray(latestSnapshotResult.rows[0].load_notes)
-      }
+      ? (function () {
+        const row = latestSnapshotResult.rows[0];
+        const snapshot = typeof row.report_json === 'string' ? JSON.parse(row.report_json) : row.report_json;
+        return {
+          period: row.period,
+          source: row.source,
+          generatedAt: row.generated_at,
+          executiveSummary: snapshot && snapshot.executiveSummary ? snapshot.executiveSummary : '',
+          alerts: ensureStringArray(snapshot && snapshot.alerts),
+          recommendations: ensureStringArray(snapshot && snapshot.recommendations),
+          loadNotes: ensureStringArray(snapshot && snapshot.loadNotes)
+        };
+      }())
       : null,
     pendingDocuments: pendingDocumentsResult.rows.map((row) => {
       const analysis = typeof row.analysis_json === 'string' ? JSON.parse(row.analysis_json) : row.analysis_json;
