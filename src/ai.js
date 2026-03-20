@@ -382,7 +382,7 @@ async function buildManagerContext(input) {
   const latestSnapshotResult = await query(
     `
       SELECT period, source, generated_at, executive_summary, alerts, recommendations, load_notes
-      FROM ai_operational_snapshots
+      FROM ai_report_snapshots
       WHERE period = $1
       ORDER BY generated_at DESC
       LIMIT 1
